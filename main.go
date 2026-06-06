@@ -339,8 +339,17 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 
 	// Flush remaining buffer
 	remaining := lineBuf.String()
-	if remaining != "" && !promptRe.MatchString(remaining) {
-		printLine(remaining)
+	if remaining != "" {
+		if loc := promptRe.FindStringIndex(remaining); loc != nil {
+			output := remaining[:loc[0]]
+			if output != "" {
+				printLine(output)
+				fmt.Println()
+			}
+		} else {
+			printLine(remaining)
+			fmt.Println()
+		}
 	}
 
 	reply := fullText.String()
@@ -766,6 +775,9 @@ func main() {
 					fmt.Print(colorizeOutput(output))
 				} else {
 					fmt.Print(output)
+				}
+				if !strings.HasSuffix(output, "\n") {
+					fmt.Println()
 				}
 			}
 		} else {
