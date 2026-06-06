@@ -59,13 +59,11 @@ logout
 ## Install
 
 ### One-liner
-
 ```bash
 go install github.com/oliynykmax/slop-shell@latest && ln -sf "$(go env GOPATH)/bin/slop-shell" ~/.local/bin/slop-shell
 ```
 
 ### From source
-
 ```bash
 git clone https://github.com/oliynykmax/slop-shell.git
 cd slop-shell
@@ -75,7 +73,7 @@ cp slop-shell ~/.local/bin/
 
 ## Configuration
 
-1. Get an API key from DeepSeek.
+1. Get an API key from [DeepSeek](https://platform.deepseek.com/).
 2. Set it as an environment variable:
 
 ```bash
@@ -88,10 +86,12 @@ Or create a `.env` file in the directory where you run `slop-shell`:
 DEEPSEEK_API_KEY=your-key-here
 ```
 
+Runs on `deepseek-v4-flash` with thinking mode disabled (`thinking: {"type": "disabled"}`). Probes the model at startup; the shell will refuse to start if the API rejects the key.
+
 ## Features
 
 ### 🎨 Colored output
-Commands like `ls`, `grep`, and `gcc` produce ANSI-colored output. Colors are parsed and injected locally using regex heuristics, not by prompting the AI (which prevents hallucinated format breakages).
+Commands like `ls`, `grep`, and `gcc` produce ANSI-colored output. Colors are parsed and injected locally using regex heuristics, not by prompting the AI (which prevents hallucinated format breakages). The prompt line itself is suppressed during streaming so the readline prompt renders cleanly on top of streamed output.
 
 ### 🔑 sudo support
 ```
@@ -104,16 +104,19 @@ Accepts any password. `sudo su` / `sudo -i` switches to root prompt (`root@slopb
 `apt install`, `pip install`, `npm install`, `cargo install` — all "work" with realistic progress output. Installed packages become "available" in subsequent commands.
 
 ### ⚡ Streaming output
-Tokens stream to your terminal as they're generated — no waiting for the full response. Disable with `--no-stream`.
+Tokens stream to your terminal as they're generated — no waiting for the full response. Disable with `--no-stream`. Line-buffered so the colorizer can tag whole lines.
 
 ### 🔍 AI tab completion
-Press Tab for AI-powered command and path completion, context-aware from your session history.
+Press Tab for AI-powered command and path completion, context-aware from your session history. Results are cached per partial input so rapid Tab presses don't hammer the API.
 
 ### 📋 Command history
-Arrow keys navigate history, `Ctrl+R` for reverse search. History persists across sessions in `~/.slop_history`.
+Arrow keys navigate history, `Ctrl+R` for reverse search. History persists across sessions in `~/.slop_history`. The session-level conversation history is kept in memory (capped at 256 messages — well under the model's ~1M token context) and sent on every turn so the model can pretend to have state.
 
-### 🖥️ Login MOTD
+### 🖼️ Login MOTD
 Realistic message-of-the-day on startup with uptime, memory, load average, and pending updates.
+
+### ⛔ Cancellable requests
+`Ctrl+C` cancels an in-flight streaming request without killing the shell. The HTTP call is tied to a `context.Context` that a SIGINT handler cancels; readline's own handler still cancels the current line as expected.
 
 ## Flags
 
@@ -141,10 +144,21 @@ Realistic message-of-the-day on startup with uptime, memory, load average, and p
 
 - Actually executing anything
 - Talking to real hardware
-- Being deterministic
+- Being deterministic — the LLM is sampled at temperature 0.7, so the same input can produce different output across runs
+- Remembering state perfectly — no real filesystem/process table, just the model's context window
 - Giving you accurate information about... anything
+
+## Architecture
+
+Three files in `package main`:
+
+- **`main.go`** — readline loop, MOTD, sudo handling, tab-completion wiring, `SlopShell` orchestration.
+- **`provider.go`** — `Provider` interface (`Chat` / `Stream` / `Probe` / `Models`) with the `DeepSeek` implementation. Retry on 429/503 with exponential backoff, response validation, SSE parser.
+- **`colorize.go`** — local ANSI colorizer driven by regex over the streamed output, so the model never has to emit escape codes.
+
+Tests in `colorize_test.go` cover the colorizer, the prompt-line detector (with NBSP / tab edge cases), and the tab-completion LRU.
 
 ## Requirements
 
 - Go 1.21+
-- A [Gemini API key](https://aistudio.google.com/apikey)
+- A [DeepSeek API key](https://platform.deepseek.com/)

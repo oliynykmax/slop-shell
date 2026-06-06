@@ -2,44 +2,25 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
-
+	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/chzyer/readline"
 )
 
-const (
-	deepseekBaseURL = "https://api.deepseek.com/v1"
-)
-
-// Models to try in order of preference.
-var modelCandidates = []string{
-	"deepseek-chat", // standard endpoint for their latest model
-	"deepseek-v4-flash",
-}
-
-// --- DeepSeek/OpenAI API types ---
+// --- OpenAI API types (shared by main + provider) ---
 
 type OpenAIMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	Stream      bool            `json:"stream,omitempty"`
-	Temperature float64         `json:"temperature"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
 }
 
 type OpenAIResponse struct {
@@ -66,15 +47,14 @@ type APIError struct {
 // --- Shell state ---
 
 type SlopShell struct {
-	apiKey       string
+	provider     Provider
 	model        string
 	history      []OpenAIMessage
 	systemPrompt OpenAIMessage
-	client       *http.Client
 	user         string
-	isRoot       bool
 	streaming    bool
 	colorize     bool
+	compCache    *completionCache
 }
 
 func buildSystemPrompt(user string) string {
@@ -126,7 +106,7 @@ Where <cwd> is the current working directory (use ~ for the user's home).
 IMPORTANT: Your entire response must be ONLY what would appear in a terminal. Start your output immediately — no preamble, no explanation.`, user, user, user)
 }
 
-func newSlopShell(apiKey, model string, streaming bool) *SlopShell {
+func newSlopShell(provider Provider, model string, streaming bool) *SlopShell {
 	user := os.Getenv("USER")
 	if user == "" {
 		user = "user"
@@ -135,35 +115,34 @@ func newSlopShell(apiKey, model string, streaming bool) *SlopShell {
 	systemText := buildSystemPrompt(user)
 
 	return &SlopShell{
-		apiKey:  apiKey,
-		model:   model,
-		history: []OpenAIMessage{},
+		provider: provider,
+		model:    model,
+		history:  []OpenAIMessage{},
 		systemPrompt: OpenAIMessage{
 			Role:    "system",
 			Content: systemText,
 		},
-		client:    &http.Client{Timeout: 120 * time.Second},
 		user:      user,
-		isRoot:    false,
 		streaming: streaming,
+		compCache: newCompletionCache(64),
 	}
 }
 
-func (s *SlopShell) chat(input string) (string, error) {
+func (s *SlopShell) chat(ctx context.Context, input string) (string, error) {
 	s.history = append(s.history, OpenAIMessage{
 		Role:    "user",
 		Content: input,
 	})
 
-	// Keep history manageable — last 50 exchanges
-	if len(s.history) > 100 {
-		s.history = s.history[len(s.history)-100:]
+	// Keep history manageable — last 128 exchanges. DeepSeek V4 has a ~1M token
+	// context window; this cap is just a sanity limit, not a context budget.
+	if len(s.history) > 256 {
+		s.history = s.history[len(s.history)-256:]
 	}
 
 	// For OpenAI, prepend system prompt to messages
 	messages := make([]OpenAIMessage, 0, len(s.history)+1)
 	messages = append(messages, s.systemPrompt)
-	
 	// Copy history and wrap the absolute latest user prompt in an anti-injection shield
 	for i, msg := range s.history {
 		if i == len(s.history)-1 && msg.Role == "user" {
@@ -172,123 +151,53 @@ func (s *SlopShell) chat(input string) (string, error) {
 		messages = append(messages, msg)
 	}
 
-	reqBody := OpenAIRequest{
+	req := ChatRequest{
 		Model:       s.model,
 		Messages:    messages,
 		Temperature: 0.7,
 		MaxTokens:   8192,
+		Thinking:    &ThinkingOptions{Type: "disabled"},
 	}
 
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal error: %w", err)
-	}
-
+	var reply string
+	var err error
 	if s.streaming {
-		reqBody.Stream = true
-		return s.chatStream(jsonData)
+		reply, err = s.runStream(ctx, req)
+	} else {
+		reply, err = s.provider.Chat(ctx, req)
 	}
-	return s.chatSync(jsonData)
-}
-
-func (s *SlopShell) chatSync(jsonData []byte) (string, error) {
-	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
-
-	var body []byte
-	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequest("POST", url, bytes.NewReader(jsonData))
-		if err != nil {
-			return "", fmt.Errorf("request error: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("request error: %w", err)
-		}
-
-		body, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return "", fmt.Errorf("read error: %w", err)
-		}
-
-		if resp.StatusCode == 429 || resp.StatusCode == 503 {
-			wait := time.Duration(1<<uint(attempt)) * time.Second
-			time.Sleep(wait)
-			continue
-		}
-		break
+	if err != nil {
+		return "", err
 	}
-
-	var dsResp OpenAIResponse
-	if err := json.Unmarshal(body, &dsResp); err != nil {
-		return "", fmt.Errorf("unmarshal error: %w", err)
-	}
-
-	if dsResp.Error != nil {
-		return "", fmt.Errorf("API error: %s", dsResp.Error.Message)
-	}
-
-	if len(dsResp.Choices) == 0 {
-		return "", fmt.Errorf("empty response from model")
-	}
-
-	reply := dsResp.Choices[0].Message.Content
 
 	s.history = append(s.history, OpenAIMessage{
 		Role:    "assistant",
 		Content: reply,
 	})
-
 	return reply, nil
 }
 
-func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
-	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
-
-	var resp *http.Response
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		req, errReq := http.NewRequest("POST", url, bytes.NewReader(jsonData))
-		if errReq != nil {
-			return "", fmt.Errorf("request error: %w", errReq)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-		resp, err = s.client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("request error: %w", err)
-		}
-
-		if resp.StatusCode == 429 || resp.StatusCode == 503 {
-			resp.Body.Close()
-			wait := time.Duration(1<<uint(attempt)) * time.Second
-			time.Sleep(wait)
-			continue
-		}
-		break
+// isPromptLine returns true if line is a shell prompt (e.g. "kort@slopbox:~$ ").
+// Trimmed-trailing-whitespace + ends-with-#-or-$ is a more permissive check than
+// the strict regex and survives NBSPs, tabs, and other whitespace the model
+// occasionally sneaks in after the prompt.
+func isPromptLine(line string) bool {
+	line = strings.TrimRight(line, " \t\r\n\v\f\x00\u00a0")
+	if !strings.Contains(line, "@slopbox:") {
+		return false
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		var apiErr struct {
-			Error *APIError `json:"error"`
-		}
-		if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
-			return "", fmt.Errorf("API error: %s", apiErr.Error.Message)
-		}
-		return "", fmt.Errorf("API error: HTTP %d", resp.StatusCode)
+	if len(line) == 0 {
+		return false
 	}
+	last := line[len(line)-1]
+	return last == '$' || last == '#'
+}
 
-	// Stream and print line-by-line with optional colorization
-	var fullText strings.Builder
+// runStream consumes deltas from the provider, line-bufferes them, and prints
+// each line through the colorizer. The final response is returned for prompt
+// extraction.
+func (s *SlopShell) runStream(ctx context.Context, req ChatRequest) (string, error) {
 	var lineBuf strings.Builder
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	printLine := func(line string) {
 		if s.colorize {
@@ -298,71 +207,60 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 		}
 	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "" || data == "[DONE]" {
-			continue
-		}
-
-		var chunk OpenAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-
-		if chunk.Error != nil {
-			return fullText.String(), fmt.Errorf("stream error: %s", chunk.Error.Message)
-		}
-
-		if len(chunk.Choices) > 0 {
-			text := chunk.Choices[0].Delta.Content
-			if text != "" {
-				fullText.WriteString(text)
-
-				// Buffer and print complete lines for colorization
-				for _, ch := range text {
-					if ch == '\n' {
-						printLine(lineBuf.String() + "\n")
-						lineBuf.Reset()
-					} else {
-						lineBuf.WriteRune(ch)
-					}
+	onDelta := func(text string) {
+		for _, ch := range text {
+			if ch == '\n' {
+				line := lineBuf.String()
+				// Skip lines that are just the shell prompt — the model
+				// emits its trailing prompt as a final line, and readline
+				// will render it itself once we update rl.SetPrompt.
+				if !isPromptLine(line) {
+					printLine(line + "\n")
 				}
+				lineBuf.Reset()
+			} else {
+				lineBuf.WriteRune(ch)
 			}
 		}
+	}
+
+	full, err := s.provider.Stream(ctx, req, onDelta)
+	if err != nil {
+		// Even on error, flush whatever the user has already seen.
+		flushLineBuffer(lineBuf.String(), printLine)
+		return full, err
 	}
 
 	// Flush remaining buffer
-	remaining := lineBuf.String()
-	if remaining != "" {
-		if loc := promptRe.FindStringIndex(remaining); loc != nil {
-			output := remaining[:loc[0]]
-			if output != "" {
-				printLine(output)
-				fmt.Println()
-			}
-		} else {
-			printLine(remaining)
+	flushLineBuffer(lineBuf.String(), printLine)
+	return full, nil
+}
+
+func flushLineBuffer(remaining string, printLine func(string)) {
+	if remaining == "" {
+		return
+	}
+	if isPromptLine(remaining) {
+		return
+	}
+	if loc := trailingPromptRe.FindStringIndex(remaining); loc != nil {
+		output := remaining[:loc[0]]
+		if output != "" {
+			printLine(output)
 			fmt.Println()
 		}
+	} else {
+		printLine(remaining)
+		fmt.Println()
 	}
-
-	reply := fullText.String()
-	s.history = append(s.history, OpenAIMessage{
-		Role:    "assistant",
-		Content: reply,
-	})
-
-	return reply, nil
 }
 
 // chatForCompletion does a quick non-streaming call for tab completion.
-func (s *SlopShell) chatForCompletion(partialInput string) []string {
+func (s *SlopShell) chatForCompletion(ctx context.Context, partialInput string) []string {
+	if cached, ok := s.compCache.get(partialInput); ok {
+		return cached
+	}
+
 	prompt := fmt.Sprintf(`The user has typed this partial command and pressed Tab:
 %s
 
@@ -391,54 +289,37 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 		messages = append(messages, OpenAIMessage{Role: "user", Content: prompt})
 	}
 
-	reqBody := OpenAIRequest{
+	req := ChatRequest{
 		Model:       s.model,
 		Messages:    messages,
 		Temperature: 0.3,
 		MaxTokens:   256,
+		Thinking:    &ThinkingOptions{Type: "disabled"},
 	}
 
-	jsonData, err := json.Marshal(reqBody)
+	// Short timeout so a slow model doesn't block the readline UI.
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	text, err := s.provider.Chat(cctx, req)
 	if err != nil {
 		return nil
 	}
 
-	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-
-	var dsResp OpenAIResponse
-	if err := json.Unmarshal(body, &dsResp); err != nil {
-		return nil
-	}
-
-	if len(dsResp.Choices) == 0 {
-		return nil
-	}
-
-	text := dsResp.Choices[0].Message.Content
-	lines := strings.Split(strings.TrimSpace(text), "\n")
-
+	seen := make(map[string]bool, 8)
 	var completions []string
-	for _, line := range lines {
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" {
-			completions = append(completions, line)
+		if line == "" || seen[line] {
+			continue
+		}
+		seen[line] = true
+		completions = append(completions, line)
+		if len(completions) >= 8 {
+			break
 		}
 	}
+
+	s.compCache.put(partialInput, completions)
 	return completions
 }
 
@@ -486,62 +367,6 @@ func generateMOTD(user string) string {
 
 	b.WriteString("\n")
 	return b.String()
-}
-
-// --- Model probing ---
-
-func probeModel(apiKey, model string) (bool, error) {
-	reqBody := OpenAIRequest{
-		Model: model,
-		Messages: []OpenAIMessage{
-			{Role: "user", Content: "echo test"},
-		},
-		Temperature: 0,
-		MaxTokens:   32,
-	}
-
-	jsonData, _ := json.Marshal(reqBody)
-	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, nil
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	var apiErr struct {
-		Error *APIError `json:"error"`
-	}
-	if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
-		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, apiErr.Error.Message)
-	}
-	return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-}
-
-func selectModel(apiKey string) (string, error) {
-	var lastErr error
-	for _, model := range modelCandidates {
-		ok, err := probeModel(apiKey, model)
-		if ok {
-			return model, nil
-		}
-		lastErr = err
-	}
-	
-	if lastErr != nil {
-		return "", fmt.Errorf("no working DeepSeek model found (last error: %v)", lastErr)
-	}
-	return "", fmt.Errorf("no working DeepSeek model found — check your API key")
 }
 
 // --- Utilities ---
@@ -605,6 +430,44 @@ func handleSudo(rl *readline.Instance, input string) (string, bool) {
 
 // --- Tab completion ---
 
+// completionCache is a tiny LRU for AI tab-completion results keyed by the
+// partial input. Tab completion is round-trip LLM work, so caching is the
+// only thing keeping rapid Tab presses from feeling laggy.
+type completionCache struct {
+	mu      sync.Mutex
+	entries map[string][]string
+	order   []string
+	max     int
+}
+
+func newCompletionCache(max int) *completionCache {
+	return &completionCache{
+		entries: make(map[string][]string, max),
+		max:     max,
+	}
+}
+
+func (c *completionCache) get(key string) ([]string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.entries[key]
+	return v, ok
+}
+
+func (c *completionCache) put(key string, value []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[key]; !exists {
+		c.order = append(c.order, key)
+	}
+	c.entries[key] = value
+	for len(c.order) > c.max {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.entries, oldest)
+	}
+}
+
 type aiCompleter struct {
 	shell *SlopShell
 }
@@ -624,7 +487,7 @@ func (c *aiCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		lastWord = input
 	}
 
-	completions := c.shell.chatForCompletion(input)
+	completions := c.shell.chatForCompletion(context.Background(), input)
 	if len(completions) == 0 {
 		return nil, 0
 	}
@@ -645,6 +508,11 @@ func (c *aiCompleter) Do(line []rune, pos int) ([][]rune, int) {
 
 // --- Main ---
 
+// trailingPromptRe extracts the trailing prompt from model output
+// (e.g. "kort@slopbox:~$ ") so the readline prompt can be updated to match
+// the simulated shell state.
+var trailingPromptRe = regexp.MustCompile(`(?m)(\S+@slopbox:[^$#]*[#$] )$`)
+
 func main() {
 	loadEnv()
 
@@ -664,7 +532,7 @@ func main() {
 
 	apiKey := os.Getenv("DEEPSEEK_API_KEY")
 	if apiKey == "" {
-		apiKey = os.Getenv("GEMINI_API_KEY") // fallback for old configs
+		apiKey = os.Getenv("GEMINI_API_KEY") // legacy fallback
 		if apiKey == "" {
 			fmt.Fprintln(os.Stderr, "error: DEEPSEEK_API_KEY not set")
 			fmt.Fprintln(os.Stderr, "set it via environment variable or .env file")
@@ -672,9 +540,22 @@ func main() {
 		}
 	}
 
+	// Root context for all provider calls. SIGINT cancels an in-flight request
+	// without killing the process; readline still gets its own Ctrl+C handling
+	// for cancelling the current line.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
 	fmt.Fprintf(os.Stderr, "\033[2m")
 
-	model, err := selectModel(apiKey)
+	provider := NewDeepSeek(apiKey)
+	model, err := selectModel(ctx, provider)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\033[0m")
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -682,7 +563,7 @@ func main() {
 	}
 
 	streaming := !noStream
-	shell := newSlopShell(apiKey, model, streaming)
+	shell := newSlopShell(provider, model, streaming)
 	shell.colorize = !noColor
 
 	user := shell.user
@@ -699,7 +580,7 @@ func main() {
 		OpenAIMessage{Role: "assistant", Content: initialPrompt},
 	)
 
-	// Set up readline with history file and AI tab completion
+	// Prefer ~/.slop_history; only fall back to /tmp if $HOME is unavailable.
 	historyFile := filepath.Join(os.TempDir(), "slop-shell-history")
 	if home, err := os.UserHomeDir(); err == nil {
 		historyFile = filepath.Join(home, ".slop_history")
@@ -721,9 +602,6 @@ func main() {
 	}
 	defer rl.Close()
 
-	// Regex to extract the trailing prompt from model output
-	promptRe := regexp.MustCompile(`(?m)(\S+@slopbox:[^$#]*[#$] )$`)
-
 	for {
 		line, err := rl.Readline()
 		if err == readline.ErrInterrupt {
@@ -735,7 +613,7 @@ func main() {
 			break
 		}
 
-		input := strings.TrimRight(line, " ")
+		input := strings.TrimSpace(line)
 
 		if input == "exit" || input == "exit 0" || input == "logout" {
 			fmt.Println("logout")
@@ -752,7 +630,7 @@ func main() {
 			continue
 		}
 
-		resp, err := shell.chat(input)
+		resp, err := shell.chat(ctx, input)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[2m[slop-shell internal: %v]\033[0m\n", err)
 			continue
@@ -762,7 +640,7 @@ func main() {
 		// For non-streaming, print now with colorization
 		if !streaming {
 			var output string
-			if loc := promptRe.FindStringIndex(resp); loc != nil {
+			if loc := trailingPromptRe.FindStringIndex(resp); loc != nil {
 				output = resp[:loc[0]]
 				newPrompt := resp[loc[0]:loc[1]]
 				rl.SetPrompt(newPrompt)
@@ -782,17 +660,10 @@ func main() {
 			}
 		} else {
 			// For streaming, just extract prompt for readline
-			if loc := promptRe.FindStringIndex(resp); loc != nil {
+			if loc := trailingPromptRe.FindStringIndex(resp); loc != nil {
 				newPrompt := resp[loc[0]:loc[1]]
 				rl.SetPrompt(newPrompt)
 			}
-		}
-
-		// Track if we switched to/from root
-		if strings.Contains(resp, "root@slopbox:") && strings.HasSuffix(strings.TrimSpace(resp), "#") {
-			shell.isRoot = true
-		} else if strings.Contains(resp, user+"@slopbox:") {
-			shell.isRoot = false
 		}
 	}
 }
