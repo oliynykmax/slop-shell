@@ -9,28 +9,28 @@ import (
 
 // ANSI color codes (modern cohesive palette)
 const (
-	colorReset       = "\033[0m"
-	colorBold        = "\033[1m"
-	colorDim         = "\033[2m"
-	colorUnderline   = "\033[4m"
+	colorReset     = "\033[0m"
+	colorBold      = "\033[1m"
+	colorDim       = "\033[2m"
+	colorUnderline = "\033[4m"
 
 	// Core colors (slightly desaturated for cohesion)
-	colorRed         = "\033[38;5;203m"
-	colorGreen       = "\033[38;5;114m"
-	colorYellow      = "\033[38;5;215m"
-	colorBlue        = "\033[38;5;111m"
-	colorMagenta     = "\033[38;5;176m"
-	colorCyan        = "\033[38;5;87m"
-	colorWhite       = "\033[38;5;252m"
-	colorOrange      = "\033[38;5;208m"
-	colorPurple      = "\033[38;5;141m"
+	colorRed     = "\033[38;5;203m"
+	colorGreen   = "\033[38;5;114m"
+	colorYellow  = "\033[38;5;215m"
+	colorBlue    = "\033[38;5;111m"
+	colorMagenta = "\033[38;5;176m"
+	colorCyan    = "\033[38;5;87m"
+	colorWhite   = "\033[38;5;252m"
+	colorOrange  = "\033[38;5;208m"
+	colorPurple  = "\033[38;5;141m"
 
 	// Bright variants for emphasis
-	colorBrightRed   = "\033[1;38;5;203m"
-	colorBrightGreen = "\033[1;38;5;114m"
-	colorBrightBlue  = "\033[1;38;5;111m"
-	colorBrightYellow= "\033[1;38;5;215m"
-	colorBrightCyan  = "\033[1;38;5;87m"
+	colorBrightRed    = "\033[1;38;5;203m"
+	colorBrightGreen  = "\033[1;38;5;114m"
+	colorBrightBlue   = "\033[1;38;5;111m"
+	colorBrightYellow = "\033[1;38;5;215m"
+	colorBrightCyan   = "\033[1;38;5;87m"
 )
 
 // File extension → color mappings
@@ -116,6 +116,31 @@ var commonDirs = map[string]bool{
 	".config": true, ".local": true, ".cache": true, ".ssh": true,
 }
 
+// Shell keywords and common commands used by command-line syntax highlighter.
+var shellKeywords = map[string]bool{
+	"if": true, "then": true, "else": true, "elif": true, "fi": true,
+	"for": true, "while": true, "do": true, "done": true,
+	"case": true, "esac": true, "in": true, "function": true,
+	"time": true, "coproc": true, "select": true,
+}
+
+var commonCommands = map[string]bool{
+	"ls": true, "cd": true, "pwd": true, "cat": true, "less": true, "more": true,
+	"head": true, "tail": true, "grep": true, "rg": true, "find": true, "locate": true,
+	"sed": true, "awk": true, "cut": true, "sort": true, "uniq": true, "wc": true,
+	"xargs": true, "tee": true, "tr": true,
+	"cp": true, "mv": true, "rm": true, "mkdir": true, "rmdir": true, "touch": true,
+	"chmod": true, "chown": true, "ln": true, "stat": true,
+	"git": true, "docker": true, "kubectl": true, "ssh": true, "scp": true,
+	"curl": true, "wget": true, "ping": true,
+	"apt": true, "apt-get": true, "dpkg": true, "npm": true, "pnpm": true, "yarn": true,
+	"pip": true, "pip3": true, "python": true, "python3": true,
+	"go": true, "cargo": true, "rustc": true, "node": true,
+	"make": true, "cmake": true, "ninja": true,
+	"export": true, "unset": true, "alias": true, "source": true, "env": true,
+	"sudo": true, "su": true,
+}
+
 // Regex patterns
 var (
 	// ls -l line: permissions, links, owner, group, size, date, name
@@ -128,6 +153,8 @@ var (
 	warningRe = regexp.MustCompile(`(?i)(warning|deprecated|caution)`)
 	// Prompt line (don't colorize)
 	promptRe = regexp.MustCompile(`\S+@slopbox:[^$#]*[#$]\s*$`)
+	// Prompt with typed input (also don't colorize)
+	promptWithInputRe = regexp.MustCompile(`^\S+@slopbox:[^$#]*[#$] .+`)
 )
 
 // colorizeOutput applies ANSI colors to shell output.
@@ -144,6 +171,10 @@ func colorizeOutput(output string) string {
 	for i, line := range lines {
 		// Don't colorize prompt lines
 		if promptRe.MatchString(line) {
+			result = append(result, line)
+			continue
+		}
+		if promptWithInputRe.MatchString(line) {
 			result = append(result, line)
 			continue
 		}
@@ -177,6 +208,12 @@ func colorizeOutput(output string) string {
 		// Warning lines
 		if warningRe.MatchString(line) {
 			result = append(result, colorYellow+line+colorReset)
+			continue
+		}
+
+		// Shell command line syntax highlighting (fish-like token classes).
+		if colored, ok := colorizeShellSyntax(line); ok {
+			result = append(result, colored)
 			continue
 		}
 
@@ -304,6 +341,9 @@ func looksLikeSimpleLs(lines []string, idx int) bool {
 	if line == "" {
 		return false
 	}
+	if looksLikeCommandLine(line) {
+		return false
+	}
 
 	words := strings.Fields(line)
 	if len(words) < 2 {
@@ -378,6 +418,7 @@ func colorizeSimpleLs(line string) string {
 
 func colorizeSimpleEntry(name string) string {
 	lower := strings.ToLower(name)
+	ext := filepath.Ext(lower)
 
 	// Known directory names
 	if commonDirs[name] {
@@ -385,18 +426,39 @@ func colorizeSimpleEntry(name string) string {
 	}
 
 	// Archive extensions
-	if strings.Contains(lower, ".tar.") || archiveExts[filepath.Ext(lower)] {
+	if strings.Contains(lower, ".tar.") || archiveExts[ext] {
 		return colorRed + name + colorReset
 	}
 
 	// Image extensions
-	if imageExts[filepath.Ext(lower)] {
+	if imageExts[ext] {
 		return colorMagenta + name + colorReset
+	}
+	if videoExts[ext] {
+		return colorPurple + name + colorReset
+	}
+	if audioExts[ext] {
+		return colorOrange + name + colorReset
+	}
+	if fontExts[ext] {
+		return colorCyan + name + colorReset
+	}
+	if codeExts[ext] {
+		return colorBrightBlue + name + colorReset
+	}
+	if configExts[ext] {
+		return colorYellow + name + colorReset
+	}
+	if docExts[ext] {
+		return colorBrightCyan + name + colorReset
+	}
+	if dataExts[ext] {
+		return colorBrightGreen + name + colorReset
 	}
 
 	// Executable extensions
-	if execExts[filepath.Ext(lower)] {
-		return colorGreen + name + colorReset
+	if execExts[ext] {
+		return colorBrightGreen + name + colorReset
 	}
 
 	// Dotfiles/hidden
@@ -410,4 +472,232 @@ func colorizeSimpleEntry(name string) string {
 	}
 
 	return name
+}
+
+func colorizeShellSyntax(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !looksLikeCommandLine(trimmed) {
+		return "", false
+	}
+
+	var out strings.Builder
+	expectCommand := true
+
+	for i := 0; i < len(line); {
+		ch := line[i]
+
+		if ch == ' ' || ch == '\t' {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+
+		if ch == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+			out.WriteString(colorDim)
+			out.WriteString(line[i:])
+			out.WriteString(colorReset)
+			break
+		}
+
+		if tok, n, isCtrl := consumeOperator(line, i); n > 0 {
+			out.WriteString(colorPurple)
+			out.WriteString(tok)
+			out.WriteString(colorReset)
+			i += n
+			if isCtrl {
+				expectCommand = true
+			}
+			continue
+		}
+
+		if ch == '\'' || ch == '"' {
+			quote := ch
+			j := i + 1
+			for j < len(line) {
+				if line[j] == '\\' && j+1 < len(line) {
+					j += 2
+					continue
+				}
+				if line[j] == quote {
+					j++
+					break
+				}
+				j++
+			}
+			out.WriteString(colorGreen)
+			out.WriteString(line[i:j])
+			out.WriteString(colorReset)
+			i = j
+			expectCommand = false
+			continue
+		}
+
+		if ch == '$' {
+			j := i + 1
+			if j < len(line) && line[j] == '{' {
+				j++
+				for j < len(line) && line[j] != '}' {
+					j++
+				}
+				if j < len(line) {
+					j++
+				}
+			} else if j < len(line) && line[j] == '(' {
+				depth := 1
+				j++
+				for j < len(line) && depth > 0 {
+					if line[j] == '(' {
+						depth++
+					} else if line[j] == ')' {
+						depth--
+					}
+					j++
+				}
+			} else {
+				for j < len(line) && isVarChar(line[j]) {
+					j++
+				}
+			}
+			out.WriteString(colorCyan)
+			out.WriteString(line[i:j])
+			out.WriteString(colorReset)
+			i = j
+			expectCommand = false
+			continue
+		}
+
+		j := i
+		for j < len(line) {
+			if line[j] == ' ' || line[j] == '\t' || line[j] == '\'' || line[j] == '"' || line[j] == '$' {
+				break
+			}
+			if _, n, _ := consumeOperator(line, j); n > 0 {
+				break
+			}
+			j++
+		}
+
+		word := line[i:j]
+		switch {
+		case strings.HasPrefix(word, "-"):
+			out.WriteString(colorYellow + word + colorReset)
+			expectCommand = false
+		case isEnvAssignment(word):
+			out.WriteString(colorCyan + word + colorReset)
+		case shellKeywords[word]:
+			out.WriteString(colorPurple + word + colorReset)
+			expectCommand = true
+		case expectCommand:
+			out.WriteString(colorBrightBlue + word + colorReset)
+			expectCommand = false
+		case looksLikePath(word):
+			out.WriteString(colorBlue + word + colorReset)
+		default:
+			out.WriteString(word)
+		}
+		i = j
+	}
+
+	return out.String(), true
+}
+
+func looksLikeCommandLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "#") {
+		return true
+	}
+
+	if strings.ContainsAny(line, "|&;<>()$`\"'") {
+		return true
+	}
+
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return false
+	}
+
+	idx := 0
+	for idx < len(parts) && isEnvAssignment(parts[idx]) {
+		idx++
+	}
+	if idx >= len(parts) {
+		return true
+	}
+
+	cmd := parts[idx]
+	if cmd == "sudo" && idx+1 < len(parts) {
+		cmd = parts[idx+1]
+	}
+
+	if shellKeywords[cmd] || commonCommands[cmd] {
+		return true
+	}
+	if strings.HasPrefix(cmd, "./") || strings.HasPrefix(cmd, "/") || strings.HasPrefix(cmd, "~/") {
+		return true
+	}
+	if len(parts) > idx+1 && strings.HasPrefix(parts[idx+1], "-") {
+		return true
+	}
+
+	return false
+}
+
+func consumeOperator(line string, i int) (string, int, bool) {
+	if i >= len(line) {
+		return "", 0, false
+	}
+	if strings.HasPrefix(line[i:], "&&") || strings.HasPrefix(line[i:], "||") {
+		return line[i : i+2], 2, true
+	}
+	if strings.HasPrefix(line[i:], ">>") || strings.HasPrefix(line[i:], "<<") {
+		return line[i : i+2], 2, false
+	}
+	if i+2 <= len(line) && line[i] >= '0' && line[i] <= '9' && line[i+1] == '>' {
+		if i+3 <= len(line) && line[i+2] == '>' {
+			return line[i : i+3], 3, false
+		}
+		return line[i : i+2], 2, false
+	}
+	if strings.HasPrefix(line[i:], "&>") {
+		return line[i : i+2], 2, false
+	}
+	if strings.HasPrefix(line[i:], "|") || strings.HasPrefix(line[i:], ";") {
+		return line[i : i+1], 1, true
+	}
+	if strings.HasPrefix(line[i:], "<") || strings.HasPrefix(line[i:], ">") {
+		return line[i : i+1], 1, false
+	}
+	return "", 0, false
+}
+
+func isVarChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'
+}
+
+func isEnvAssignment(word string) bool {
+	eq := strings.IndexByte(word, '=')
+	if eq <= 0 {
+		return false
+	}
+	name := word[:eq]
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		if i == 0 {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_') {
+				return false
+			}
+			continue
+		}
+		if !isVarChar(ch) {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikePath(word string) bool {
+	return strings.HasPrefix(word, "./") || strings.HasPrefix(word, "../") || strings.HasPrefix(word, "~/") || strings.HasPrefix(word, "/") || strings.Contains(word, "/")
 }

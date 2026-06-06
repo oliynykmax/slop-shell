@@ -152,7 +152,7 @@ func TestColorizeFileByExt(t *testing.T) {
 	}{
 		{"archive.tar.gz", colorRed},
 		{"photo.png", colorMagenta},
-		{"script.sh", colorGreen},
+		{"script.sh", colorBrightGreen},
 		{".hidden", colorDim},
 		{"plain", ""}, // no extension, no color
 	}
@@ -164,6 +164,45 @@ func TestColorizeFileByExt(t *testing.T) {
 			}
 		} else if !strings.Contains(out, tc.wantColor) {
 			t.Errorf("colorizeFileByExt(%q) = %q, want color %q", tc.in, out, tc.wantColor)
+		}
+	}
+}
+
+func TestColorizeOutput_CommandSyntax(t *testing.T) {
+	in := "FOO=bar ls -la ~/src | grep main.go"
+	out := colorizeOutput(in)
+
+	if !strings.Contains(out, colorCyan+"FOO=bar"+colorReset) {
+		t.Errorf("expected env assignment to be cyan: %q", out)
+	}
+	if !strings.Contains(out, colorBrightBlue+"ls"+colorReset) {
+		t.Errorf("expected command to be bright blue: %q", out)
+	}
+	if !strings.Contains(out, colorYellow+"-la"+colorReset) {
+		t.Errorf("expected flag to be yellow: %q", out)
+	}
+	if !strings.Contains(out, colorBlue+"~/src"+colorReset) {
+		t.Errorf("expected path to be blue: %q", out)
+	}
+	if !strings.Contains(out, colorPurple+"|"+colorReset) {
+		t.Errorf("expected pipe to be purple: %q", out)
+	}
+}
+
+func TestLooksLikeCommandLine(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"ls -la", true},
+		{"FOO=bar ./script.sh", true},
+		{"Desktop Documents Downloads", false},
+		{"notes.txt report.md", false},
+	}
+	for _, tc := range cases {
+		got := looksLikeCommandLine(tc.in)
+		if got != tc.want {
+			t.Errorf("looksLikeCommandLine(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
