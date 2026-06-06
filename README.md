@@ -95,6 +95,3 @@ The shell automatically picks the best available Gemini model (tries newest firs
 - Go 1.21+
 - A [Gemini API key](https://aistudio.google.com/apikey)
 
-## License
-
-MIT
