@@ -18,62 +18,49 @@ import (
 )
 
 const (
-	geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
+	deepseekBaseURL = "https://api.deepseek.com/v1"
 )
 
-// Models to try in order of preference (newest/best first).
+// Models to try in order of preference.
 var modelCandidates = []string{
-	"gemini-3.5-flash",
-	"gemini-2.5-flash",
+	"deepseek-chat", // standard endpoint for their latest model
+	"deepseek-v4-flash",
 }
 
-// --- Gemini API types ---
+// --- DeepSeek/OpenAI API types ---
 
-type GeminiRequest struct {
-	Contents          []Content         `json:"contents"`
-	SystemInstruction *Content          `json:"systemInstruction,omitempty"`
-	GenerationConfig  *GenerationConfig `json:"generationConfig,omitempty"`
+type OpenAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-type Content struct {
-	Role  string `json:"role,omitempty"`
-	Parts []Part `json:"parts"`
+type OpenAIRequest struct {
+	Model       string          `json:"model"`
+	Messages    []OpenAIMessage `json:"messages"`
+	Stream      bool            `json:"stream,omitempty"`
+	Temperature float64         `json:"temperature"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
 }
 
-type Part struct {
-	Text string `json:"text"`
+type OpenAIResponse struct {
+	Choices []struct {
+		Message OpenAIMessage `json:"message"`
+	} `json:"choices"`
+	Error *APIError `json:"error,omitempty"`
 }
 
-type GenerationConfig struct {
-	Temperature     float64 `json:"temperature"`
-	MaxOutputTokens int     `json:"maxOutputTokens"`
-}
-
-type GeminiResponse struct {
-	Candidates []Candidate `json:"candidates"`
-	Error      *APIError   `json:"error,omitempty"`
-}
-
-type Candidate struct {
-	Content Content `json:"content"`
+type OpenAIStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Error *APIError `json:"error,omitempty"`
 }
 
 type APIError struct {
-	Code    int    `json:"code"`
 	Message string `json:"message"`
-	Status  string `json:"status"`
-}
-
-// --- Streaming types ---
-
-type StreamChunk struct {
-	Candidates []StreamCandidate `json:"candidates"`
-	Error      *APIError         `json:"error,omitempty"`
-}
-
-type StreamCandidate struct {
-	Content      Content `json:"content"`
-	FinishReason string  `json:"finishReason,omitempty"`
+	Type    string `json:"type"`
 }
 
 // --- Shell state ---
@@ -81,8 +68,8 @@ type StreamCandidate struct {
 type SlopShell struct {
 	apiKey       string
 	model        string
-	history      []Content
-	systemPrompt Content
+	history      []OpenAIMessage
+	systemPrompt OpenAIMessage
 	client       *http.Client
 	user         string
 	isRoot       bool
@@ -150,9 +137,10 @@ func newSlopShell(apiKey, model string, streaming bool) *SlopShell {
 	return &SlopShell{
 		apiKey:  apiKey,
 		model:   model,
-		history: []Content{},
-		systemPrompt: Content{
-			Parts: []Part{{Text: systemText}},
+		history: []OpenAIMessage{},
+		systemPrompt: OpenAIMessage{
+			Role:    "system",
+			Content: systemText,
 		},
 		client:    &http.Client{Timeout: 120 * time.Second},
 		user:      user,
@@ -162,9 +150,9 @@ func newSlopShell(apiKey, model string, streaming bool) *SlopShell {
 }
 
 func (s *SlopShell) chat(input string) (string, error) {
-	s.history = append(s.history, Content{
-		Role:  "user",
-		Parts: []Part{{Text: input}},
+	s.history = append(s.history, OpenAIMessage{
+		Role:    "user",
+		Content: input,
 	})
 
 	// Keep history manageable — last 50 exchanges
@@ -172,13 +160,16 @@ func (s *SlopShell) chat(input string) (string, error) {
 		s.history = s.history[len(s.history)-100:]
 	}
 
-	reqBody := GeminiRequest{
-		Contents:          s.history,
-		SystemInstruction: &s.systemPrompt,
-		GenerationConfig: &GenerationConfig{
-			Temperature:     0.7,
-			MaxOutputTokens: 8192,
-		},
+	// For OpenAI, prepend system prompt to messages
+	messages := make([]OpenAIMessage, 0, len(s.history)+1)
+	messages = append(messages, s.systemPrompt)
+	messages = append(messages, s.history...)
+
+	reqBody := OpenAIRequest{
+		Model:       s.model,
+		Messages:    messages,
+		Temperature: 0.7,
+		MaxTokens:   8192,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -187,17 +178,25 @@ func (s *SlopShell) chat(input string) (string, error) {
 	}
 
 	if s.streaming {
+		reqBody.Stream = true
 		return s.chatStream(jsonData)
 	}
 	return s.chatSync(jsonData)
 }
 
 func (s *SlopShell) chatSync(jsonData []byte) (string, error) {
-	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, s.model, s.apiKey)
+	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
 
 	var body []byte
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
+		req, err := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+		if err != nil {
+			return "", fmt.Errorf("request error: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+		resp, err := s.client.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("request error: %w", err)
 		}
@@ -216,36 +215,43 @@ func (s *SlopShell) chatSync(jsonData []byte) (string, error) {
 		break
 	}
 
-	var geminiResp GeminiResponse
-	if err := json.Unmarshal(body, &geminiResp); err != nil {
+	var dsResp OpenAIResponse
+	if err := json.Unmarshal(body, &dsResp); err != nil {
 		return "", fmt.Errorf("unmarshal error: %w", err)
 	}
 
-	if geminiResp.Error != nil {
-		return "", fmt.Errorf("API error [%d]: %s", geminiResp.Error.Code, geminiResp.Error.Message)
+	if dsResp.Error != nil {
+		return "", fmt.Errorf("API error: %s", dsResp.Error.Message)
 	}
 
-	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+	if len(dsResp.Choices) == 0 {
 		return "", fmt.Errorf("empty response from model")
 	}
 
-	reply := geminiResp.Candidates[0].Content.Parts[0].Text
+	reply := dsResp.Choices[0].Message.Content
 
-	s.history = append(s.history, Content{
-		Role:  "model",
-		Parts: []Part{{Text: reply}},
+	s.history = append(s.history, OpenAIMessage{
+		Role:    "assistant",
+		Content: reply,
 	})
 
 	return reply, nil
 }
 
 func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
-	url := fmt.Sprintf("%s/%s:streamGenerateContent?alt=sse&key=%s", geminiBaseURL, s.model, s.apiKey)
+	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
 
 	var resp *http.Response
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = s.client.Post(url, "application/json", bytes.NewReader(jsonData))
+		req, errReq := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+		if errReq != nil {
+			return "", fmt.Errorf("request error: %w", errReq)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+		resp, err = s.client.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("request error: %w", err)
 		}
@@ -266,7 +272,7 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 			Error *APIError `json:"error"`
 		}
 		if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
-			return "", fmt.Errorf("API error [%d]: %s", apiErr.Error.Code, apiErr.Error.Message)
+			return "", fmt.Errorf("API error: %s", apiErr.Error.Message)
 		}
 		return "", fmt.Errorf("API error: HTTP %d", resp.StatusCode)
 	}
@@ -293,46 +299,47 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 		}
 
 		data := strings.TrimPrefix(line, "data: ")
-		if data == "" {
+		if data == "" || data == "[DONE]" {
 			continue
 		}
 
-		var chunk StreamChunk
+		var chunk OpenAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
 
 		if chunk.Error != nil {
-			return fullText.String(), fmt.Errorf("stream error [%d]: %s", chunk.Error.Code, chunk.Error.Message)
+			return fullText.String(), fmt.Errorf("stream error: %s", chunk.Error.Message)
 		}
 
-		if len(chunk.Candidates) > 0 && len(chunk.Candidates[0].Content.Parts) > 0 {
-			text := chunk.Candidates[0].Content.Parts[0].Text
-			fullText.WriteString(text)
+		if len(chunk.Choices) > 0 {
+			text := chunk.Choices[0].Delta.Content
+			if text != "" {
+				fullText.WriteString(text)
 
-			// Buffer and print complete lines for colorization
-			for _, ch := range text {
-				if ch == '\n' {
-					printLine(lineBuf.String() + "\n")
-					lineBuf.Reset()
-				} else {
-					lineBuf.WriteRune(ch)
+				// Buffer and print complete lines for colorization
+				for _, ch := range text {
+					if ch == '\n' {
+						printLine(lineBuf.String() + "\n")
+						lineBuf.Reset()
+					} else {
+						lineBuf.WriteRune(ch)
+					}
 				}
 			}
 		}
 	}
 
-	// Flush remaining buffer (likely the prompt — don't print it, let readline handle it)
-	// But if it's not a prompt, print it
+	// Flush remaining buffer
 	remaining := lineBuf.String()
 	if remaining != "" && !promptRe.MatchString(remaining) {
 		printLine(remaining)
 	}
 
 	reply := fullText.String()
-	s.history = append(s.history, Content{
-		Role:  "model",
-		Parts: []Part{{Text: reply}},
+	s.history = append(s.history, OpenAIMessage{
+		Role:    "assistant",
+		Content: reply,
 	})
 
 	return reply, nil
@@ -347,18 +354,8 @@ Return ONLY a newline-separated list of possible completions (the full completed
 If it looks like a path, complete the path. If it looks like a command, complete the command.
 Return between 1-8 completions, most likely first. Just the completion words, nothing else.`, partialInput)
 
-	reqBody := GeminiRequest{
-		Contents: []Content{{
-			Role:  "user",
-			Parts: []Part{{Text: prompt}},
-		}},
-		SystemInstruction: &Content{
-			Parts: []Part{{Text: "You are a bash shell tab-completion engine. Return only completion candidates, one per line. No explanations, no formatting, no markdown. Just the words."}},
-		},
-		GenerationConfig: &GenerationConfig{
-			Temperature:     0.3,
-			MaxOutputTokens: 256,
-		},
+	messages := []OpenAIMessage{
+		{Role: "system", Content: "You are a bash shell tab-completion engine. Return only completion candidates, one per line. No explanations, no formatting, no markdown. Just the words."},
 	}
 
 	// Include recent history for context
@@ -369,13 +366,20 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 		}
 		historyContext := "Recent shell history for context:\n"
 		for _, h := range recent {
-			if h.Role == "user" && len(h.Parts) > 0 {
-				historyContext += "$ " + h.Parts[0].Text + "\n"
+			if h.Role == "user" && h.Content != "" {
+				historyContext += "$ " + h.Content + "\n"
 			}
 		}
-		reqBody.Contents = []Content{
-			{Role: "user", Parts: []Part{{Text: historyContext + "\n" + prompt}}},
-		}
+		messages = append(messages, OpenAIMessage{Role: "user", Content: historyContext + "\n" + prompt})
+	} else {
+		messages = append(messages, OpenAIMessage{Role: "user", Content: prompt})
+	}
+
+	reqBody := OpenAIRequest{
+		Model:       s.model,
+		Messages:    messages,
+		Temperature: 0.3,
+		MaxTokens:   256,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -383,9 +387,13 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 		return nil
 	}
 
-	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, s.model, s.apiKey)
+	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(jsonData))
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil
 	}
@@ -396,16 +404,16 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 		return nil
 	}
 
-	var geminiResp GeminiResponse
-	if err := json.Unmarshal(body, &geminiResp); err != nil {
+	var dsResp OpenAIResponse
+	if err := json.Unmarshal(body, &dsResp); err != nil {
 		return nil
 	}
 
-	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+	if len(dsResp.Choices) == 0 {
 		return nil
 	}
 
-	text := geminiResp.Candidates[0].Content.Parts[0].Text
+	text := dsResp.Choices[0].Message.Content
 	lines := strings.Split(strings.TrimSpace(text), "\n")
 
 	var completions []string
@@ -467,22 +475,24 @@ func generateMOTD(user string) string {
 // --- Model probing ---
 
 func probeModel(apiKey, model string) (bool, error) {
-	reqBody := GeminiRequest{
-		Contents: []Content{{
-			Role:  "user",
-			Parts: []Part{{Text: "echo test"}},
-		}},
-		GenerationConfig: &GenerationConfig{
-			Temperature:     0,
-			MaxOutputTokens: 32,
+	reqBody := OpenAIRequest{
+		Model: model,
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "echo test"},
 		},
+		Temperature: 0,
+		MaxTokens:   32,
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, model, apiKey)
+	url := fmt.Sprintf("%s/chat/completions", deepseekBaseURL)
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(jsonData))
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -513,9 +523,9 @@ func selectModel(apiKey string) (string, error) {
 	}
 	
 	if lastErr != nil {
-		return "", fmt.Errorf("no working Gemini model found (last error: %v)", lastErr)
+		return "", fmt.Errorf("no working DeepSeek model found (last error: %v)", lastErr)
 	}
-	return "", fmt.Errorf("no working Gemini model found — check your API key")
+	return "", fmt.Errorf("no working DeepSeek model found — check your API key")
 }
 
 // --- Utilities ---
@@ -636,11 +646,14 @@ func main() {
 		}
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	apiKey := os.Getenv("DEEPSEEK_API_KEY")
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: GEMINI_API_KEY not set")
-		fmt.Fprintln(os.Stderr, "set it via environment variable or .env file")
-		os.Exit(1)
+		apiKey = os.Getenv("GEMINI_API_KEY") // fallback for old configs
+		if apiKey == "" {
+			fmt.Fprintln(os.Stderr, "error: DEEPSEEK_API_KEY not set")
+			fmt.Fprintln(os.Stderr, "set it via environment variable or .env file")
+			os.Exit(1)
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "\033[2m")
@@ -666,8 +679,8 @@ func main() {
 
 	// Seed history so model knows where we started
 	shell.history = append(shell.history,
-		Content{Role: "user", Parts: []Part{{Text: ""}}},
-		Content{Role: "model", Parts: []Part{{Text: initialPrompt}}},
+		OpenAIMessage{Role: "user", Content: "init"},
+		OpenAIMessage{Role: "assistant", Content: initialPrompt},
 	)
 
 	// Set up readline with history file and AI tab completion

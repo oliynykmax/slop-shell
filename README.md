@@ -75,16 +75,17 @@ cp slop-shell ~/.local/bin/
 
 ## Configuration
 
-Set your Gemini API key:
+1. Get an API key from DeepSeek.
+2. Set it as an environment variable:
 
 ```bash
-export GEMINI_API_KEY="your-key-here"
+export DEEPSEEK_API_KEY="your-key-here"
 ```
 
 Or create a `.env` file in the directory where you run `slop-shell`:
 
 ```
-GEMINI_API_KEY=your-key-here
+DEEPSEEK_API_KEY=your-key-here
 ```
 
 ## Features
