@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -55,6 +56,32 @@ type SlopShell struct {
 	streaming    bool
 	colorize     bool
 	compCache    *completionCache
+
+	// inflightCancel cancels the in-flight provider request when the user
+	// hits Ctrl+C. A per-request context is installed by the readline loop
+	// before each chat call and cleared afterwards, so SIGINT only aborts
+	// the current request — the next one starts with a fresh context.
+	inflightMu     sync.Mutex
+	inflightCancel context.CancelFunc
+}
+
+// setInflight registers a cancel function the SIGINT handler can call to
+// abort the current request. Pass nil to clear.
+func (s *SlopShell) setInflight(cancel context.CancelFunc) {
+	s.inflightMu.Lock()
+	s.inflightCancel = cancel
+	s.inflightMu.Unlock()
+}
+
+// cancelInflight aborts the in-flight request, if any. Safe to call when
+// no request is active.
+func (s *SlopShell) cancelInflight() {
+	s.inflightMu.Lock()
+	cancel := s.inflightCancel
+	s.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func buildSystemPrompt(user string) string {
@@ -499,22 +526,16 @@ func main() {
 		}
 	}
 
-	// Root context for all provider calls. SIGINT cancels an in-flight request
-	// without killing the process; readline still gets its own Ctrl+C handling
-	// for cancelling the current line.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	// Root context for the model probe only. The per-request context used
+	// by the readline loop is derived fresh for each chat call so SIGINT
+	// can cancel a single request without poisoning the next one.
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	defer probeCancel()
 
 	fmt.Fprintf(os.Stderr, "\033[2m")
 
 	provider := NewDeepSeek(apiKey)
-	model, err := selectModel(ctx, provider)
+	model, err := selectModel(probeCtx, provider)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\033[0m")
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -524,6 +545,17 @@ func main() {
 	streaming := !noStream
 	shell := newSlopShell(provider, model, streaming)
 	shell.colorize = !noColor
+
+	// SIGINT during streaming cancels the in-flight request via the
+	// per-request cancel registered in the readline loop. Readline
+	// handles Ctrl+C while it owns the terminal (returns ErrInterrupt).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for range sigCh {
+			shell.cancelInflight()
+		}
+	}()
 
 	user := shell.user
 
@@ -589,8 +621,17 @@ func main() {
 			continue
 		}
 
-		resp, err := shell.chat(ctx, input)
+		// Fresh per-request context so SIGINT only cancels this request.
+		reqCtx, reqCancel := context.WithCancel(context.Background())
+		shell.setInflight(reqCancel)
+		resp, err := shell.chat(reqCtx, input)
+		shell.setInflight(nil)
+		reqCancel()
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				// User pressed Ctrl+C — expected, stay quiet.
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "\033[2m[slop-shell internal: %v]\033[0m\n", err)
 			continue
 		}
