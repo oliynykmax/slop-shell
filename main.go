@@ -24,9 +24,12 @@ const (
 // Models to try in order of preference (newest/best first).
 var modelCandidates = []string{
 	"gemini-3.5-flash",
+	"gemini-3.1-pro",
 	"gemini-2.5-flash",
 	"gemini-2.5-pro",
 	"gemini-2.0-flash",
+	"gemini-1.5-pro",
+	"gemini-1.5-flash",
 }
 
 // --- Gemini API types ---
@@ -468,7 +471,7 @@ func generateMOTD(user string) string {
 
 // --- Model probing ---
 
-func probeModel(apiKey, model string) bool {
+func probeModel(apiKey, model string) (bool, error) {
 	reqBody := GeminiRequest{
 		Contents: []Content{{
 			Role:  "user",
@@ -486,24 +489,42 @@ func probeModel(apiKey, model string) bool {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(jsonData))
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == 200
+	if resp.StatusCode == 200 {
+		return true, nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var apiErr struct {
+		Error *APIError `json:"error"`
+	}
+	if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, apiErr.Error.Message)
+	}
+	return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
 
 func selectModel(apiKey string) (string, error) {
 	fmt.Fprintf(os.Stderr, "\033[2m")
+	var lastErr error
 	for _, model := range modelCandidates {
 		fmt.Fprintf(os.Stderr, "  probing %s... ", model)
-		if probeModel(apiKey, model) {
+		ok, err := probeModel(apiKey, model)
+		if ok {
 			fmt.Fprintf(os.Stderr, "✓\n\033[0m")
 			return model, nil
 		}
+		lastErr = err
 		fmt.Fprintf(os.Stderr, "✗\n")
 	}
 	fmt.Fprintf(os.Stderr, "\033[0m")
+	
+	if lastErr != nil {
+		return "", fmt.Errorf("no working Gemini model found — check your API key (last error: %v)", lastErr)
+	}
 	return "", fmt.Errorf("no working Gemini model found — check your API key")
 }
 
