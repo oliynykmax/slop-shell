@@ -10,15 +10,19 @@ The AI maintains a consistent virtual environment — it tracks your current dir
 
 ```
 $ slop-shell
+  probing gemini-3.5-flash... ✓
 
 Welcome to slopbox!
 
-  Ubuntu 24.04 LTS (Noble Numbat)
-  Kernel: Linux 6.8.0-slop x86_64
-  Uptime: 18 days, 14:32
-  Load:   0.24, 0.11, 0.08
-  Memory: 3840MB / 16384MB (12544MB free)
+  OS:      Ubuntu 24.04 LTS (Noble Numbat)
+  Kernel:  Linux 6.8.0-slop x86_64
+  Uptime:  18 days, 14:32
+  Load:    0.24, 0.11, 0.08
+  Memory:  3840MB / 16384MB (12544MB free)
+  Procs:   207
+
   Last login: Thu Jun 5 11:32:48 2026 from 192.168.1.142
+  9 updates available (2 security)
 
 kort@slopbox:~$ ls -la
 total 48
@@ -87,7 +91,7 @@ GEMINI_API_KEY=your-key-here
 ## Features
 
 ### 🎨 Colored output
-Commands like `ls`, `grep`, `gcc` produce ANSI-colored output just like a real terminal.
+Commands like `ls`, `grep`, and `gcc` produce ANSI-colored output. Colors are parsed and injected locally using regex heuristics, not by prompting the AI (which prevents hallucinated format breakages).
 
 ### 🔑 sudo support
 ```
