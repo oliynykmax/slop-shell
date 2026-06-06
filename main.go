@@ -682,7 +682,11 @@ func main() {
 
 	for {
 		line, err := rl.Readline()
-		if err != nil { // io.EOF or Ctrl+D
+		if err == readline.ErrInterrupt {
+			// Ctrl+C — cancel current line, just like bash
+			continue
+		}
+		if err != nil { // io.EOF (Ctrl+D)
 			fmt.Println("logout")
 			break
 		}
