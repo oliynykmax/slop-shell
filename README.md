@@ -10,7 +10,6 @@ The AI maintains a consistent virtual environment — it tracks your current dir
 
 ```
 $ slop-shell
-  probing gemini-3.5-flash... ✓
 
 Welcome to slopbox!
 

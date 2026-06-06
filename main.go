@@ -24,12 +24,7 @@ const (
 // Models to try in order of preference (newest/best first).
 var modelCandidates = []string{
 	"gemini-3.5-flash",
-	"gemini-3.1-pro",
 	"gemini-2.5-flash",
-	"gemini-2.5-pro",
-	"gemini-2.0-flash",
-	"gemini-1.5-pro",
-	"gemini-1.5-flash",
 }
 
 // --- Gemini API types ---
@@ -508,22 +503,17 @@ func probeModel(apiKey, model string) (bool, error) {
 }
 
 func selectModel(apiKey string) (string, error) {
-	fmt.Fprintf(os.Stderr, "\033[2m")
 	var lastErr error
 	for _, model := range modelCandidates {
-		fmt.Fprintf(os.Stderr, "  probing %s... ", model)
 		ok, err := probeModel(apiKey, model)
 		if ok {
-			fmt.Fprintf(os.Stderr, "✓\n\033[0m")
 			return model, nil
 		}
 		lastErr = err
-		fmt.Fprintf(os.Stderr, "✗\n")
 	}
-	fmt.Fprintf(os.Stderr, "\033[0m")
 	
 	if lastErr != nil {
-		return "", fmt.Errorf("no working Gemini model found — check your API key (last error: %v)", lastErr)
+		return "", fmt.Errorf("no working Gemini model found (last error: %v)", lastErr)
 	}
 	return "", fmt.Errorf("no working Gemini model found — check your API key")
 }
