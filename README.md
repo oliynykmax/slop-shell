@@ -11,30 +11,44 @@ The AI maintains a consistent virtual environment — it tracks your current dir
 ```
 $ slop-shell
 
-   _____ __            _____ __         ____
-  / ___// /___  ____  / ___// /_  ___  / / /
-  \__ \/ / __ \/ __ \ \__ \/ __ \/ _ \/ / /
- ___/ / / /_/ / /_/ /___/ / / / /  __/ / /
-/____/_/\____/ .___//____/_/ /_/\___/_/_/
-            /_/
-  powered by gemini-2.5-flash
-  nothing here is real. type 'exit' to wake up.
+Welcome to slopbox!
+
+  Ubuntu 24.04 LTS (Noble Numbat)
+  Kernel: Linux 6.8.0-slop x86_64
+  Uptime: 18 days, 14:32
+  Load:   0.24, 0.11, 0.08
+  Memory: 3840MB / 16384MB (12544MB free)
+  Last login: Thu Jun 5 11:32:48 2026 from 192.168.1.142
 
 kort@slopbox:~$ ls -la
-total 28
-drwxr-xr-x  3 kort kort 4096 Apr 20 10:00 .
+total 48
+drwxr-xr-x  8 kort kort 4096 Jun  6 14:32 .
 drwxr-xr-x  3 root root 4096 Apr 20 09:58 ..
--rw-------  1 kort kort  123 Apr 20 10:00 .bash_history
--rw-r--r--  1 kort kort  220 Mar 20 2023 .bash_logout
+-rw-------  1 kort kort  456 Jun  6 14:30 .bash_history
 -rw-r--r--  1 kort kort 3771 Mar 20 2023 .bashrc
+drwxr-xr-x  3 kort kort 4096 May 15 09:12 .config
+drwxr-xr-x  2 kort kort 4096 Jun  1 16:45 Desktop
+drwxr-xr-x  2 kort kort 4096 May 28 11:23 Documents
+drwxr-xr-x  2 kort kort 4096 Jun  3 19:00 Downloads
+drwxr-xr-x  3 kort kort 4096 May 20 14:15 projects
 -rw-r--r--  1 kort kort  807 Mar 20 2023 .profile
-kort@slopbox:~$ cat /etc/os-release
-PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
-NAME="Debian GNU/Linux"
-VERSION_ID="12"
-...
-kort@slopbox:~$ echo "none of this is real" | wc -w
-5
+kort@slopbox:~$ sudo apt install cowsay
+[sudo] password for kort:
+Reading package lists... Done
+Building dependency tree... Done
+The following NEW packages will be installed:
+  cowsay
+0 upgraded, 1 newly installed, 0 to remove and 3 not upgraded.
+Setting up cowsay (3.03+dfsg2-8) ...
+kort@slopbox:~$ cowsay "nothing is real"
+ _________________
+< nothing is real >
+ -----------------
+        \   ^__^
+         \  (oo)\_______
+            (__)\       )\/\
+                ||----w |
+                ||     ||
 kort@slopbox:~$ exit
 logout
 ```
@@ -70,7 +84,50 @@ Or create a `.env` file in the directory where you run `slop-shell`:
 GEMINI_API_KEY=your-key-here
 ```
 
-The shell automatically picks the best available Gemini model (tries newest first).
+## Features
+
+### 🎨 Colored output
+Commands like `ls`, `grep`, `gcc` produce ANSI-colored output just like a real terminal.
+
+### 🔑 sudo support
+```
+kort@slopbox:~$ sudo cat /etc/shadow
+[sudo] password for kort:
+```
+Accepts any password. `sudo su` / `sudo -i` switches to root prompt (`root@slopbox:~#`).
+
+### 📦 Fake package manager
+`apt install`, `pip install`, `npm install`, `cargo install` — all "work" with realistic progress output. Installed packages become "available" in subsequent commands.
+
+### ⚡ Streaming output
+Tokens stream to your terminal as they're generated — no waiting for the full response. Disable with `--no-stream`.
+
+### 🔍 AI tab completion
+Press Tab for AI-powered command and path completion, context-aware from your session history.
+
+### 📋 Command history
+Arrow keys navigate history, `Ctrl+R` for reverse search. History persists across sessions in `~/.slop_history`.
+
+### 🐧 Distro themes
+```bash
+slop-shell --distro arch    # btw
+slop-shell --distro ubuntu  # default
+slop-shell --distro debian  # stable life
+slop-shell --distro fedora  # cutting edge
+slop-shell --distro gentoo  # emerge yourself
+```
+
+### 🖥️ Login MOTD
+Realistic message-of-the-day on startup with uptime, memory, load average, and pending updates.
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--distro` | Linux distro to simulate: `ubuntu`, `arch`, `debian`, `fedora`, `gentoo` (default: `ubuntu`) |
+| `--no-stream` | Disable streaming output |
+| `--no-motd` | Disable login MOTD |
+| `--no-color` | Disable colored output hints |
 
 ## What works
 
@@ -79,9 +136,12 @@ The shell automatically picks the best available Gemini model (tries newest firs
 - Pipes (`|`), chaining (`&&`, `||`, `;`)
 - Environment variables (`export`, `$VAR`)
 - Redirects (`>`, `>>`)
+- `sudo` with fake password prompt
+- Package managers (`apt`, `pip`, `npm`, `cargo`)
 - Realistic error messages for invalid commands
 - Persistent state within a session — create a file, it "exists" later
 - `Ctrl+C` to interrupt
+- Arrow keys + `Ctrl+R` for command history
 
 ## What doesn't work
 
@@ -94,4 +154,3 @@ The shell automatically picks the best available Gemini model (tries newest firs
 
 - Go 1.21+
 - A [Gemini API key](https://aistudio.google.com/apikey)
-

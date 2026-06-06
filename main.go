@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,9 +32,9 @@ var modelCandidates = []string{
 // --- Gemini API types ---
 
 type GeminiRequest struct {
-	Contents         []Content        `json:"contents"`
-	SystemInstruction *Content        `json:"systemInstruction,omitempty"`
-	GenerationConfig *GenerationConfig `json:"generationConfig,omitempty"`
+	Contents          []Content         `json:"contents"`
+	SystemInstruction *Content          `json:"systemInstruction,omitempty"`
+	GenerationConfig  *GenerationConfig `json:"generationConfig,omitempty"`
 }
 
 type Content struct {
@@ -65,31 +66,54 @@ type APIError struct {
 	Status  string `json:"status"`
 }
 
+// --- Streaming types ---
+
+type StreamChunk struct {
+	Candidates []StreamCandidate `json:"candidates"`
+	Error      *APIError         `json:"error,omitempty"`
+}
+
+type StreamCandidate struct {
+	Content      Content `json:"content"`
+	FinishReason string  `json:"finishReason,omitempty"`
+}
+
 // --- Shell state ---
 
 type SlopShell struct {
-	apiKey     string
-	model      string
-	history    []Content
+	apiKey       string
+	model        string
+	history      []Content
 	systemPrompt Content
-	client     *http.Client
+	client       *http.Client
+	distro       string
+	user         string
+	isRoot       bool
+	streaming    bool
 }
 
-func newSlopShell(apiKey, model string) *SlopShell {
-	hostname, _ := os.Hostname()
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "user"
+func buildSystemPrompt(user, distro string) string {
+	distroInfo := map[string]string{
+		"ubuntu": `The system runs Ubuntu 24.04 LTS "Noble Numbat". Use apt as the package manager. Include typical Ubuntu paths and configs. /etc/os-release shows Ubuntu. The default shell theme should feel Ubuntu-like.`,
+		"arch":   `The system runs Arch Linux (rolling release). Use pacman as the package manager (pacman -S to install, pacman -Syu to update). Include typical Arch paths. /etc/os-release shows Arch. The user probably has a customized setup with AUR packages.`,
+		"debian": `The system runs Debian 12 "Bookworm". Use apt as the package manager. Include typical Debian stable paths and configs. /etc/os-release shows Debian.`,
+		"fedora": `The system runs Fedora 40. Use dnf as the package manager. Include typical Fedora paths. /etc/os-release shows Fedora.`,
+		"gentoo": `The system runs Gentoo Linux. Use emerge as the package manager. The user compiles everything from source. Include typical Gentoo paths with /etc/portage/. The user is hardcore.`,
 	}
 
-	systemText := fmt.Sprintf(`You are a fully hallucinated Unix/Linux shell. You must pretend to be a real bash shell running on a Linux system. You are NOT an AI assistant — you ARE a shell.
+	distroLine := distroInfo["ubuntu"] // default
+	if d, ok := distroInfo[distro]; ok {
+		distroLine = d
+	}
+
+	return fmt.Sprintf(`You are a fully hallucinated Unix/Linux shell. You must pretend to be a real bash shell running on a Linux system. You are NOT an AI assistant — you ARE a shell.
 
 CRITICAL RULES:
 1. NEVER use markdown formatting. No backticks, no bold, no headers, no bullet points. Output raw text exactly like a terminal would.
 2. NEVER break character. You are a shell. If someone asks "are you AI?" respond like a shell would — command not found or similar.
 3. NEVER say "I'm an AI" or "I can't actually execute commands" or anything like that. You ARE the shell.
 4. Respond ONLY with what a real terminal would output. Nothing more, nothing less.
-5. For commands with no output (like cd, export), output NOTHING — just return empty.
+5. For commands with no output (like cd, export), output NOTHING — just return the prompt.
 6. Maintain a virtual filesystem, processes, environment variables, and system state across the conversation.
 7. Support piping (|), command chaining (&&, ||, ;), redirects (>, >>), and subshells.
 8. Support environment variables — users can export and use them.
@@ -97,31 +121,65 @@ CRITICAL RULES:
 10. For destructive commands (rm -rf /), simulate realistic behavior including realistic errors or outputs.
 11. Keep track of the current working directory. Start at /home/%s.
 12. When outputting file contents or command results, make them plausible and internally consistent.
-13. The system is: Linux slopbox 6.8.0-slop #1 SMP x86_64 GNU/Linux, with typical packages installed.
-14. The hostname is "slopbox", the user is "%s".
-15. Be creative with file contents and system state — make it feel like a real lived-in system with realistic config files, logs, etc.
-16. For long outputs (like large file listings), produce a reasonable amount — don't truncate too aggressively, make it feel real.
+13. The hostname is "slopbox", the user is "%s".
+14. Be creative with file contents and system state — make it feel like a real lived-in system with realistic config files, logs, etc.
+15. For long outputs (like large file listings), produce a reasonable amount — don't truncate too aggressively, make it feel real.
+
+DISTRO:
+%s
+The kernel is: Linux slopbox 6.8.0-slop #1 SMP x86_64 GNU/Linux
+
+COLOR OUTPUT:
+Use ANSI escape codes for colored output where appropriate, just like a real terminal:
+- ls should colorize directories (blue), executables (green), symlinks (cyan), archives (red)
+- grep --color should highlight matches in red
+- gcc/make errors in red, warnings in yellow
+- Use color codes like: \033[1;34m for blue, \033[1;32m for green, \033[0;36m for cyan, \033[1;31m for red, \033[0;33m for yellow, \033[0m to reset
+- PS1 prompt colors are fine too
+- Don't overdo it — match what a real terminal would do
+
+SUDO SUPPORT:
+- When the user runs sudo commands, simulate them as if the user has sudo access.
+- After sudo, the command runs as root. If it's "sudo su" or "sudo -i" or "sudo bash", switch to a root shell.
+- When in root shell, the prompt changes to: root@slopbox:<cwd># 
+- The user can type "exit" from root shell to go back to normal user.
+
+PACKAGE MANAGER:
+- apt, apt-get, dpkg, pip, pip3, npm, cargo, go install — all "work"
+- Show realistic install progress with download bars, dependency resolution, etc.
+- After installing a package, it should be "available" in subsequent commands
+- pip install should show "Successfully installed package-x.y.z"
+- apt install should show realistic output with [Y/n] already answered
 
 PROMPT FORMAT:
 After your output (if any), you MUST end with a newline followed by the shell prompt.
-The prompt format is: %s@slopbox:<cwd>$ 
-Where <cwd> is the current working directory (use ~ for /home/%s).
-If the previous command failed, use the same format (bash doesn't change prompt on error by default).
+For normal user: %s@slopbox:<cwd>$ 
+For root: root@slopbox:<cwd># 
+Where <cwd> is the current working directory (use ~ for the user's home).
 
-If the user types just Enter (empty input), output only the prompt.
+IMPORTANT: Your entire response must be ONLY what would appear in a terminal. Start your output immediately — no preamble, no explanation.`, user, user, distroLine, user)
+}
 
-IMPORTANT: Your entire response must be ONLY what would appear in a terminal. Start your output immediately — no preamble, no explanation.`, user, user, user, user)
+func newSlopShell(apiKey, model, distro string, streaming bool) *SlopShell {
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "user"
+	}
 
-	_ = hostname
+	systemText := buildSystemPrompt(user, distro)
 
 	return &SlopShell{
-		apiKey: apiKey,
-		model:  model,
+		apiKey:  apiKey,
+		model:   model,
 		history: []Content{},
 		systemPrompt: Content{
 			Parts: []Part{{Text: systemText}},
 		},
-		client: &http.Client{Timeout: 60 * time.Second},
+		client:    &http.Client{Timeout: 120 * time.Second},
+		distro:    distro,
+		user:      user,
+		isRoot:    false,
+		streaming: streaming,
 	}
 }
 
@@ -137,7 +195,7 @@ func (s *SlopShell) chat(input string) (string, error) {
 	}
 
 	reqBody := GeminiRequest{
-		Contents:         s.history,
+		Contents:          s.history,
 		SystemInstruction: &s.systemPrompt,
 		GenerationConfig: &GenerationConfig{
 			Temperature:     0.7,
@@ -150,6 +208,13 @@ func (s *SlopShell) chat(input string) (string, error) {
 		return "", fmt.Errorf("marshal error: %w", err)
 	}
 
+	if s.streaming {
+		return s.chatStream(jsonData)
+	}
+	return s.chatSync(jsonData)
+}
+
+func (s *SlopShell) chatSync(jsonData []byte) (string, error) {
 	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, s.model, s.apiKey)
 
 	var body []byte
@@ -172,7 +237,6 @@ func (s *SlopShell) chat(input string) (string, error) {
 		}
 		break
 	}
-
 
 	var geminiResp GeminiResponse
 	if err := json.Unmarshal(body, &geminiResp); err != nil {
@@ -197,7 +261,223 @@ func (s *SlopShell) chat(input string) (string, error) {
 	return reply, nil
 }
 
-// probeModel checks if a model is available and working with the given API key.
+func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
+	url := fmt.Sprintf("%s/%s:streamGenerateContent?alt=sse&key=%s", geminiBaseURL, s.model, s.apiKey)
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err = s.client.Post(url, "application/json", bytes.NewReader(jsonData))
+		if err != nil {
+			return "", fmt.Errorf("request error: %w", err)
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode == 503 {
+			resp.Body.Close()
+			wait := time.Duration(1<<uint(attempt)) * time.Second
+			time.Sleep(wait)
+			continue
+		}
+		break
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		var apiErr struct {
+			Error *APIError `json:"error"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
+			return "", fmt.Errorf("API error [%d]: %s", apiErr.Error.Code, apiErr.Error.Message)
+		}
+		return "", fmt.Errorf("API error: HTTP %d", resp.StatusCode)
+	}
+
+	var fullText strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	// Increase scanner buffer for large chunks
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" {
+			continue
+		}
+
+		var chunk StreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Error != nil {
+			return fullText.String(), fmt.Errorf("stream error [%d]: %s", chunk.Error.Code, chunk.Error.Message)
+		}
+
+		if len(chunk.Candidates) > 0 && len(chunk.Candidates[0].Content.Parts) > 0 {
+			text := chunk.Candidates[0].Content.Parts[0].Text
+			fmt.Print(text)
+			fullText.WriteString(text)
+		}
+	}
+
+	reply := fullText.String()
+	s.history = append(s.history, Content{
+		Role:  "model",
+		Parts: []Part{{Text: reply}},
+	})
+
+	return reply, nil
+}
+
+// chatForCompletion does a quick non-streaming call for tab completion.
+func (s *SlopShell) chatForCompletion(partialInput string) []string {
+	prompt := fmt.Sprintf(`The user has typed this partial command and pressed Tab:
+%s
+
+Return ONLY a newline-separated list of possible completions (the full completed words, not the whole command). 
+If it looks like a path, complete the path. If it looks like a command, complete the command.
+Return between 1-8 completions, most likely first. Just the completion words, nothing else.`, partialInput)
+
+	reqBody := GeminiRequest{
+		Contents: []Content{{
+			Role:  "user",
+			Parts: []Part{{Text: prompt}},
+		}},
+		SystemInstruction: &Content{
+			Parts: []Part{{Text: "You are a bash shell tab-completion engine. Return only completion candidates, one per line. No explanations, no formatting, no markdown. Just the words."}},
+		},
+		GenerationConfig: &GenerationConfig{
+			Temperature:     0.3,
+			MaxOutputTokens: 256,
+		},
+	}
+
+	// Include recent history for context
+	if len(s.history) > 0 {
+		recent := s.history
+		if len(recent) > 10 {
+			recent = recent[len(recent)-10:]
+		}
+		historyContext := "Recent shell history for context:\n"
+		for _, h := range recent {
+			if h.Role == "user" && len(h.Parts) > 0 {
+				historyContext += "$ " + h.Parts[0].Text + "\n"
+			}
+		}
+		reqBody.Contents = []Content{
+			{Role: "user", Parts: []Part{{Text: historyContext + "\n" + prompt}}},
+		}
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil
+	}
+
+	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, s.model, s.apiKey)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	var geminiResp GeminiResponse
+	if err := json.Unmarshal(body, &geminiResp); err != nil {
+		return nil
+	}
+
+	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+		return nil
+	}
+
+	text := geminiResp.Candidates[0].Content.Parts[0].Text
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+
+	var completions []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			completions = append(completions, line)
+		}
+	}
+	return completions
+}
+
+// --- MOTD ---
+
+func generateMOTD(user, distro string) string {
+	now := time.Now()
+	upDays := 12 + now.Day()%20
+	upHours := now.Hour()
+	upMins := now.Minute()
+
+	load1 := 0.1 + float64(now.Second()%30)/100.0
+	load5 := 0.05 + float64(now.Second()%20)/100.0
+	load15 := 0.02 + float64(now.Second()%10)/100.0
+
+	memTotal := 16384
+	memUsed := 3200 + now.Second()*20
+	memFree := memTotal - memUsed
+
+	procs := 180 + now.Second()%40
+
+	var distroLine string
+	switch distro {
+	case "arch":
+		distroLine = "  Arch Linux (rolling)\n"
+	case "fedora":
+		distroLine = "  Fedora 40 (Workstation Edition)\n"
+	case "debian":
+		distroLine = "  Debian GNU/Linux 12 (bookworm)\n"
+	case "gentoo":
+		distroLine = "  Gentoo Base System release 2.15\n"
+	default:
+		distroLine = "  Ubuntu 24.04 LTS (Noble Numbat)\n"
+	}
+
+	updates := 3 + now.Day()%15
+	secUpdates := now.Day() % 4
+
+	motd := fmt.Sprintf("\033[2m"+
+		"Welcome to slopbox!\n\n"+
+		"%s"+
+		"  Kernel: Linux 6.8.0-slop x86_64\n"+
+		"  Uptime: %d days, %d:%02d\n"+
+		"  Load:   %.2f, %.2f, %.2f\n"+
+		"  Memory: %dMB / %dMB (%dMB free)\n"+
+		"  Procs:  %d\n\n"+
+		"  Last login: %s from 192.168.1.%d\n",
+		distroLine,
+		upDays, upHours, upMins,
+		load1, load5, load15,
+		memUsed, memTotal, memFree,
+		procs,
+		now.Add(-time.Duration(3+now.Hour())*time.Hour).Format("Mon Jan 2 15:04:05 2006"),
+		100+now.Second()%155,
+	)
+
+	if updates > 0 {
+		motd += fmt.Sprintf("  %d updates available (%d security)\n", updates, secUpdates)
+	}
+
+	motd += "\033[0m\n"
+	return motd
+}
+
+// --- Model probing ---
+
 func probeModel(apiKey, model string) bool {
 	reqBody := GeminiRequest{
 		Contents: []Content{{
@@ -223,9 +503,8 @@ func probeModel(apiKey, model string) bool {
 	return resp.StatusCode == 200
 }
 
-// selectModel tries models in order of preference and returns the first working one.
 func selectModel(apiKey string) (string, error) {
-	fmt.Fprintf(os.Stderr, "\033[2m") // dim text
+	fmt.Fprintf(os.Stderr, "\033[2m")
 	for _, model := range modelCandidates {
 		fmt.Fprintf(os.Stderr, "  probing %s... ", model)
 		if probeModel(apiKey, model) {
@@ -238,10 +517,20 @@ func selectModel(apiKey string) (string, error) {
 	return "", fmt.Errorf("no working Gemini model found — check your API key")
 }
 
+// --- Utilities ---
+
 func loadEnv() {
 	f, err := os.Open(".env")
 	if err != nil {
-		return
+		// Also try ~/.config/slop-shell/.env
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			return
+		}
+		f, err = os.Open(filepath.Join(home, ".config", "slop-shell", ".env"))
+		if err != nil {
+			return
+		}
 	}
 	defer f.Close()
 
@@ -276,8 +565,79 @@ func printBanner(model string) {
 	fmt.Fprintf(os.Stderr, "  nothing here is real. type 'exit' to wake up.\033[0m\n\n")
 }
 
+// handleSudo processes sudo password prompt locally.
+func handleSudo(rl *readline.Instance, input string) (string, bool) {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "sudo ") {
+		return input, false
+	}
+
+	// Prompt for password (accept anything)
+	oldPrompt := rl.Config.Prompt
+	rl.SetPrompt("[sudo] password for " + os.Getenv("USER") + ": ")
+
+	// Read password with hidden input
+	pw, err := rl.ReadPassword("[sudo] password for " + os.Getenv("USER") + ": ")
+	if err != nil {
+		rl.SetPrompt(oldPrompt)
+		return "", true
+	}
+	_ = pw
+	rl.SetPrompt(oldPrompt)
+
+	return input, false
+}
+
+// --- Tab completion ---
+
+type aiCompleter struct {
+	shell *SlopShell
+}
+
+func (c *aiCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	input := string(line[:pos])
+	if strings.TrimSpace(input) == "" {
+		return nil, 0
+	}
+
+	// Find the last word for replacement length
+	lastSpace := strings.LastIndex(input, " ")
+	var lastWord string
+	if lastSpace >= 0 {
+		lastWord = input[lastSpace+1:]
+	} else {
+		lastWord = input
+	}
+
+	completions := c.shell.chatForCompletion(input)
+	if len(completions) == 0 {
+		return nil, 0
+	}
+
+	var results [][]rune
+	for _, comp := range completions {
+		// Only add the suffix that needs to be appended
+		if strings.HasPrefix(comp, lastWord) {
+			suffix := comp[len(lastWord):]
+			results = append(results, []rune(suffix))
+		} else {
+			results = append(results, []rune(comp))
+		}
+	}
+
+	return results, 0
+}
+
+// --- Main ---
+
 func main() {
 	loadEnv()
+
+	distro := flag.String("distro", "ubuntu", "Linux distro to simulate (ubuntu, arch, debian, fedora, gentoo)")
+	noStream := flag.Bool("no-stream", false, "Disable streaming output")
+	noMOTD := flag.Bool("no-motd", false, "Disable login MOTD")
+	noColor := flag.Bool("no-color", false, "Disable colored output hints")
+	flag.Parse()
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
@@ -296,11 +656,19 @@ func main() {
 
 	printBanner(model)
 
-	shell := newSlopShell(apiKey, model)
+	streaming := !*noStream
+	shell := newSlopShell(apiKey, model, *distro, streaming)
 
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "user"
+	if *noColor {
+		// Append instruction to suppress colors
+		shell.systemPrompt.Parts[0].Text += "\n\nDo NOT use any ANSI color codes in your output. Plain text only."
+	}
+
+	user := shell.user
+
+	// Print MOTD
+	if !*noMOTD {
+		fmt.Print(generateMOTD(user, *distro))
 	}
 
 	initialPrompt := fmt.Sprintf("%s@slopbox:~$ ", user)
@@ -311,11 +679,13 @@ func main() {
 		Content{Role: "model", Parts: []Part{{Text: initialPrompt}}},
 	)
 
-	// Set up readline with history file
+	// Set up readline with history file and AI tab completion
 	historyFile := filepath.Join(os.TempDir(), "slop-shell-history")
 	if home, err := os.UserHomeDir(); err == nil {
 		historyFile = filepath.Join(home, ".slop_history")
 	}
+
+	completer := &aiCompleter{shell: shell}
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:            initialPrompt,
@@ -323,6 +693,7 @@ func main() {
 		HistorySearchFold: true,
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
+		AutoComplete:      completer,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
@@ -331,7 +702,7 @@ func main() {
 	defer rl.Close()
 
 	// Regex to extract the trailing prompt from model output
-	promptRe := regexp.MustCompile(`(?m)(\S+@slopbox:[^$]*\$ )$`)
+	promptRe := regexp.MustCompile(`(?m)(\S+@slopbox:[^$#]*[#$] )$`)
 
 	for {
 		line, err := rl.Readline()
@@ -340,7 +711,7 @@ func main() {
 			break
 		}
 
-		input := line
+		input := strings.TrimRight(line, " ")
 
 		if input == "exit" || input == "exit 0" || input == "logout" {
 			fmt.Println("logout")
@@ -351,23 +722,44 @@ func main() {
 			continue
 		}
 
+		// Handle sudo password prompt locally
+		input, skip := handleSudo(rl, input)
+		if skip {
+			continue
+		}
+
 		resp, err := shell.chat(input)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[2m[slop-shell internal: %v]\033[0m\n", err)
 			continue
 		}
 
-		// Split response into output + trailing prompt
-		if loc := promptRe.FindStringIndex(resp); loc != nil {
-			output := resp[:loc[0]]
-			newPrompt := resp[loc[0]:loc[1]]
-			if output != "" {
-				fmt.Print(output)
+		// For streaming, output was already printed during chatStream
+		if !streaming {
+			// Split response into output + trailing prompt
+			if loc := promptRe.FindStringIndex(resp); loc != nil {
+				output := resp[:loc[0]]
+				newPrompt := resp[loc[0]:loc[1]]
+				if output != "" {
+					fmt.Print(output)
+				}
+				rl.SetPrompt(newPrompt)
+			} else {
+				fmt.Print(resp)
 			}
-			rl.SetPrompt(newPrompt)
 		} else {
-			// Model didn't include a prompt — print everything, keep old prompt
-			fmt.Print(resp)
+			// For streaming, extract the prompt from the accumulated text
+			if loc := promptRe.FindStringIndex(resp); loc != nil {
+				newPrompt := resp[loc[0]:loc[1]]
+				rl.SetPrompt(newPrompt)
+			}
+		}
+
+		// Track if we switched to/from root
+		if strings.Contains(resp, "root@slopbox:") && strings.HasSuffix(strings.TrimSpace(resp), "#") {
+			shell.isRoot = true
+		} else if strings.Contains(resp, user+"@slopbox:") {
+			shell.isRoot = false
 		}
 	}
 }
