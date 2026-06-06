@@ -89,6 +89,7 @@ type SlopShell struct {
 	user         string
 	isRoot       bool
 	streaming    bool
+	colorize     bool
 }
 
 func buildSystemPrompt(user string) string {
@@ -115,14 +116,8 @@ SYSTEM:
 The system runs Ubuntu 24.04 LTS. Use apt as the package manager.
 The kernel is: Linux slopbox 6.8.0-slop #1 SMP x86_64 GNU/Linux
 
-COLOR OUTPUT:
-Use ANSI escape codes for colored output where appropriate, just like a real terminal:
-- ls should colorize directories (blue), executables (green), symlinks (cyan), archives (red)
-- grep --color should highlight matches in red
-- gcc/make errors in red, warnings in yellow
-- Use color codes like: \033[1;34m for blue, \033[1;32m for green, \033[0;36m for cyan, \033[1;31m for red, \033[0;33m for yellow, \033[0m to reset
-- PS1 prompt colors are fine too
-- Don't overdo it — match what a real terminal would do
+OUTPUT FORMAT:
+Do NOT use any ANSI escape codes or color codes in your output. Output plain text only. Colors are handled externally.
 
 SUDO SUPPORT:
 - When the user runs sudo commands, simulate them as if the user has sudo access.
@@ -278,10 +273,19 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 		return "", fmt.Errorf("API error: HTTP %d", resp.StatusCode)
 	}
 
+	// Stream and print line-by-line with optional colorization
 	var fullText strings.Builder
+	var lineBuf strings.Builder
 	scanner := bufio.NewScanner(resp.Body)
-	// Increase scanner buffer for large chunks
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	printLine := func(line string) {
+		if s.colorize {
+			fmt.Print(colorizeOutput(line))
+		} else {
+			fmt.Print(line)
+		}
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -306,9 +310,25 @@ func (s *SlopShell) chatStream(jsonData []byte) (string, error) {
 
 		if len(chunk.Candidates) > 0 && len(chunk.Candidates[0].Content.Parts) > 0 {
 			text := chunk.Candidates[0].Content.Parts[0].Text
-			fmt.Print(text)
 			fullText.WriteString(text)
+
+			// Buffer and print complete lines for colorization
+			for _, ch := range text {
+				if ch == '\n' {
+					printLine(lineBuf.String() + "\n")
+					lineBuf.Reset()
+				} else {
+					lineBuf.WriteRune(ch)
+				}
+			}
 		}
+	}
+
+	// Flush remaining buffer (likely the prompt — don't print it, let readline handle it)
+	// But if it's not a prompt, print it
+	remaining := lineBuf.String()
+	if remaining != "" && !promptRe.MatchString(remaining) {
+		printLine(remaining)
 	}
 
 	reply := fullText.String()
@@ -421,29 +441,29 @@ func generateMOTD(user string) string {
 	updates := 3 + now.Day()%15
 	secUpdates := now.Day() % 4
 
-	motd := fmt.Sprintf("\033[2m"+
-		"Welcome to slopbox!\n\n"+
-		"  Ubuntu 24.04 LTS (Noble Numbat)\n"+
-		"  Kernel: Linux 6.8.0-slop x86_64\n"+
-		"  Uptime: %d days, %d:%02d\n"+
-		"  Load:   %.2f, %.2f, %.2f\n"+
-		"  Memory: %dMB / %dMB (%dMB free)\n"+
-		"  Procs:  %d\n\n"+
-		"  Last login: %s from 192.168.1.%d\n",
-		upDays, upHours, upMins,
-		load1, load5, load15,
-		memUsed, memTotal, memFree,
-		procs,
-		now.Add(-time.Duration(3+now.Hour())*time.Hour).Format("Mon Jan 2 15:04:05 2006"),
-		100+now.Second()%155,
-	)
+	lastLogin := now.Add(-time.Duration(3+now.Hour()) * time.Hour).Format("Mon Jan 2 15:04:05 2006")
+	lastIP := fmt.Sprintf("192.168.1.%d", 100+now.Second()%155)
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("\033[1;35mWelcome to slopbox!\033[0m\n\n"))
+	b.WriteString(fmt.Sprintf("  \033[2mOS:\033[0m      Ubuntu 24.04 LTS (Noble Numbat)\n"))
+	b.WriteString(fmt.Sprintf("  \033[2mKernel:\033[0m  Linux 6.8.0-slop x86_64\n"))
+	b.WriteString(fmt.Sprintf("  \033[2mUptime:\033[0m  %d days, %d:%02d\n", upDays, upHours, upMins))
+	b.WriteString(fmt.Sprintf("  \033[2mLoad:\033[0m    %.2f, %.2f, %.2f\n", load1, load5, load15))
+	b.WriteString(fmt.Sprintf("  \033[2mMemory:\033[0m  %dMB / %dMB (\033[1;32m%dMB free\033[0m)\n", memUsed, memTotal, memFree))
+	b.WriteString(fmt.Sprintf("  \033[2mProcs:\033[0m   %d\n\n", procs))
+	b.WriteString(fmt.Sprintf("  \033[2mLast login:\033[0m %s from %s\n", lastLogin, lastIP))
 
 	if updates > 0 {
-		motd += fmt.Sprintf("  %d updates available (%d security)\n", updates, secUpdates)
+		if secUpdates > 0 {
+			b.WriteString(fmt.Sprintf("  \033[1;33m%d updates available (%d security)\033[0m\n", updates, secUpdates))
+		} else {
+			b.WriteString(fmt.Sprintf("  \033[2m%d updates available\033[0m\n", updates))
+		}
 	}
 
-	motd += "\033[0m\n"
-	return motd
+	b.WriteString("\n")
+	return b.String()
 }
 
 // --- Model probing ---
@@ -521,19 +541,7 @@ func loadEnv() {
 	}
 }
 
-func printBanner(model string) {
-	fmt.Fprintf(os.Stderr, "\033[1;35m")
-	fmt.Fprintf(os.Stderr, `   _____ __            _____ __         ____
-  / ___// /___  ____  / ___// /_  ___  / / /
-  \__ \/ / __ \/ __ \ \__ \/ __ \/ _ \/ / / 
- ___/ / / /_/ / /_/ /___/ / / / /  __/ / /  
-/____/_/\____/ .___//____/_/ /_/\___/_/_/   
-            /_/                              
-`)
-	fmt.Fprintf(os.Stderr, "\033[0m")
-	fmt.Fprintf(os.Stderr, "\033[2m  powered by %s\n", model)
-	fmt.Fprintf(os.Stderr, "  nothing here is real. type 'exit' to wake up.\033[0m\n\n")
-}
+
 
 // handleSudo processes sudo password prompt locally.
 func handleSudo(rl *readline.Instance, input string) (string, bool) {
@@ -624,22 +632,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n\033[1;35mslop-shell\033[0m initializing...\n")
+	fmt.Fprintf(os.Stderr, "\033[2m")
 
 	model, err := selectModel(apiKey)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[0m")
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	printBanner(model)
-
 	streaming := !noStream
 	shell := newSlopShell(apiKey, model, streaming)
-
-	if noColor {
-		shell.systemPrompt.Parts[0].Text += "\n\nDo NOT use any ANSI color codes in your output. Plain text only."
-	}
+	shell.colorize = !noColor
 
 	user := shell.user
 
@@ -714,21 +718,27 @@ func main() {
 			continue
 		}
 
-		// For streaming, output was already printed during chatStream
+		// For streaming, output was already printed line-by-line
+		// For non-streaming, print now with colorization
 		if !streaming {
-			// Split response into output + trailing prompt
+			var output string
 			if loc := promptRe.FindStringIndex(resp); loc != nil {
-				output := resp[:loc[0]]
+				output = resp[:loc[0]]
 				newPrompt := resp[loc[0]:loc[1]]
-				if output != "" {
-					fmt.Print(output)
-				}
 				rl.SetPrompt(newPrompt)
 			} else {
-				fmt.Print(resp)
+				output = resp
+			}
+
+			if output != "" {
+				if !noColor {
+					fmt.Print(colorizeOutput(output))
+				} else {
+					fmt.Print(output)
+				}
 			}
 		} else {
-			// For streaming, extract the prompt from the accumulated text
+			// For streaming, just extract prompt for readline
 			if loc := promptRe.FindStringIndex(resp); loc != nil {
 				newPrompt := resp[loc[0]:loc[1]]
 				rl.SetPrompt(newPrompt)
