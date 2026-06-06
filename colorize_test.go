@@ -253,14 +253,14 @@ func TestIsPromptLine(t *testing.T) {
 		{"kort@slopbox:~$", true},
 		{"kort@slopbox:~# ", true},
 		{"root@slopbox:/etc# ", true},
-		{"kort@slopbox:~$\u00a0", true},  // NBSP
-		{"kort@slopbox:~$\t", true},       // tab
-		{"kort@slopbox:~$  ", true},       // extra spaces
-		{"Documents  Downloads", false},   // not a prompt
+		{"kort@slopbox:~$\u00a0", true}, // NBSP
+		{"kort@slopbox:~$\t", true},     // tab
+		{"kort@slopbox:~$  ", true},     // extra spaces
+		{"Documents  Downloads", false}, // not a prompt
 		{"/home/kort", false},
 		{"", false},
-		{"welcome to slopbox", false},     // no @slopbox
-		{"PS1='\\u@\\h:\\w\\$ '", false},  // prompt definition, ends with quote
+		{"welcome to slopbox", false},    // no @slopbox
+		{"PS1='\\u@\\h:\\w\\$ '", false}, // prompt definition, ends with quote
 	}
 	for _, tc := range cases {
 		got := isPromptLine(tc.in)

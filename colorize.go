@@ -251,11 +251,21 @@ func looksLikeFilename(s string) bool {
 	if len(s) > 1 && s[0] >= 'A' && s[0] <= 'Z' {
 		return true
 	}
-	// Lowercase word without spaces
-	if len(s) > 0 && !strings.Contains(s, " ") {
-		return true
+	// Otherwise require a single token (no spaces) that contains at least
+	// one ASCII letter — otherwise pure digits/symbols like "1" or "42"
+	// would match and the simple-ls heuristic would miscolor command
+	// output like `echo 1 1`.
+	if strings.Contains(s, " ") {
+		return false
 	}
-	return false
+	hasLetter := false
+	for _, ch := range s {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+			hasLetter = true
+			break
+		}
+	}
+	return hasLetter
 }
 
 func colorizeSimpleLs(line string) string {

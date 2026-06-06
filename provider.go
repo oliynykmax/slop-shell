@@ -56,7 +56,7 @@ func NewDeepSeek(apiKey string) *DeepSeek {
 	}
 }
 
-func (d *DeepSeek) Name() string  { return "deepseek" }
+func (d *DeepSeek) Name() string { return "deepseek" }
 func (d *DeepSeek) Models() []string {
 	return []string{"deepseek-v4-flash"}
 }
