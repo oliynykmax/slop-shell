@@ -326,47 +326,8 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 // --- MOTD ---
 
 func generateMOTD(user string) string {
-	now := time.Now()
-	upDays := 12 + now.Day()%20
-	upHours := now.Hour()
-	upMins := now.Minute()
-
-	load1 := 0.1 + float64(now.Second()%30)/100.0
-	load5 := 0.05 + float64(now.Second()%20)/100.0
-	load15 := 0.02 + float64(now.Second()%10)/100.0
-
-	memTotal := 16384
-	memUsed := 3200 + now.Second()*20
-	memFree := memTotal - memUsed
-
-	procs := 180 + now.Second()%40
-
-	updates := 3 + now.Day()%15
-	secUpdates := now.Day() % 4
-
-	lastLogin := now.Add(-time.Duration(3+now.Hour()) * time.Hour).Format("Mon Jan 2 15:04:05 2006")
-	lastIP := fmt.Sprintf("192.168.1.%d", 100+now.Second()%155)
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\033[1;35mWelcome to slopbox!\033[0m\n\n"))
-	b.WriteString(fmt.Sprintf("  \033[2mOS:\033[0m      Ubuntu 24.04 LTS (Noble Numbat)\n"))
-	b.WriteString(fmt.Sprintf("  \033[2mKernel:\033[0m  Linux 6.8.0-slop x86_64\n"))
-	b.WriteString(fmt.Sprintf("  \033[2mUptime:\033[0m  %d days, %d:%02d\n", upDays, upHours, upMins))
-	b.WriteString(fmt.Sprintf("  \033[2mLoad:\033[0m    %.2f, %.2f, %.2f\n", load1, load5, load15))
-	b.WriteString(fmt.Sprintf("  \033[2mMemory:\033[0m  %dMB / %dMB (\033[1;32m%dMB free\033[0m)\n", memUsed, memTotal, memFree))
-	b.WriteString(fmt.Sprintf("  \033[2mProcs:\033[0m   %d\n\n", procs))
-	b.WriteString(fmt.Sprintf("  \033[2mLast login:\033[0m %s from %s\n", lastLogin, lastIP))
-
-	if updates > 0 {
-		if secUpdates > 0 {
-			b.WriteString(fmt.Sprintf("  \033[1;33m%d updates available (%d security)\033[0m\n", updates, secUpdates))
-		} else {
-			b.WriteString(fmt.Sprintf("  \033[2m%d updates available\033[0m\n", updates))
-		}
-	}
-
-	b.WriteString("\n")
-	return b.String()
+	_ = user
+	return "\033[1;35mWelcome to the slop shell\033[0m\n"
 }
 
 // --- Utilities ---
