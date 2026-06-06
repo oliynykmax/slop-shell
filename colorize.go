@@ -7,33 +7,100 @@ import (
 	"strings"
 )
 
-// ANSI color codes
+// ANSI color codes (modern cohesive palette)
 const (
-	colorReset   = "\033[0m"
-	colorBold    = "\033[1m"
-	colorDim     = "\033[2m"
-	colorRed     = "\033[1;31m"
-	colorGreen   = "\033[1;32m"
-	colorYellow  = "\033[0;33m"
-	colorBlue    = "\033[1;34m"
-	colorMagenta = "\033[1;35m"
-	colorCyan    = "\033[0;36m"
-	colorWhite   = "\033[1;37m"
+	colorReset       = "\033[0m"
+	colorBold        = "\033[1m"
+	colorDim         = "\033[2m"
+	colorUnderline   = "\033[4m"
+
+	// Core colors (slightly desaturated for cohesion)
+	colorRed         = "\033[38;5;203m"
+	colorGreen       = "\033[38;5;114m"
+	colorYellow      = "\033[38;5;215m"
+	colorBlue        = "\033[38;5;111m"
+	colorMagenta     = "\033[38;5;176m"
+	colorCyan        = "\033[38;5;87m"
+	colorWhite       = "\033[38;5;252m"
+	colorOrange      = "\033[38;5;208m"
+	colorPurple      = "\033[38;5;141m"
+
+	// Bright variants for emphasis
+	colorBrightRed   = "\033[1;38;5;203m"
+	colorBrightGreen = "\033[1;38;5;114m"
+	colorBrightBlue  = "\033[1;38;5;111m"
+	colorBrightYellow= "\033[1;38;5;215m"
+	colorBrightCyan  = "\033[1;38;5;87m"
 )
 
 // File extension → color mappings
 var archiveExts = map[string]bool{
 	".tar": true, ".gz": true, ".bz2": true, ".xz": true, ".zip": true,
 	".rar": true, ".7z": true, ".tgz": true, ".deb": true, ".rpm": true,
+	".zst": true, ".lz4": true, ".lzma": true, ".cab": true, ".msi": true,
+	".apk": true, ".ipa": true, ".jar": true, ".war": true, ".ear": true,
 }
 
 var imageExts = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".bmp": true,
-	".svg": true, ".webp": true, ".ico": true,
+	".svg": true, ".webp": true, ".ico": true, ".tiff": true, ".tif": true,
+	".heic": true, ".heif": true, ".avif": true, ".raw": true, ".cr2": true,
+	".nef": true, ".arw": true, ".dng": true, ".psd": true, ".xcf": true,
 }
 
 var execExts = map[string]bool{
 	".sh": true, ".bash": true, ".py": true, ".rb": true, ".pl": true,
+	".js": true, ".ts": true, ".mjs": true, ".cjs": true,
+	".php": true, ".lua": true, ".r": true, ".jl": true,
+	".fish": true, ".zsh": true, ".ps1": true, ".bat": true, ".cmd": true,
+}
+
+var codeExts = map[string]bool{
+	".go": true, ".rs": true, ".c": true, ".h": true, ".cpp": true,
+	".hpp": true, ".cc": true, ".cxx": true, ".java": true, ".kt": true,
+	".scala": true, ".cs": true, ".fs": true, ".vb": true,
+	".swift": true, ".m": true, ".mm": true,
+	".zig": true, ".nim": true, ".cr": true, ".ex": true, ".exs": true,
+	".ml": true, ".mli": true, ".hs": true, ".lhs": true,
+	".clj": true, ".cljs": true, ".cljc": true, ".edn": true,
+	".elm": true, ".purs": true, ".dhall": true,
+}
+
+var configExts = map[string]bool{
+	".json": true, ".yaml": true, ".yml": true, ".toml": true,
+	".ini": true, ".cfg": true, ".conf": true, ".config": true,
+	".xml": true, ".plist": true, ".properties": true,
+	".env": true, ".envrc": true, ".flaskenv": true,
+}
+
+var docExts = map[string]bool{
+	".md": true, ".markdown": true, ".txt": true, ".rst": true,
+	".adoc": true, ".asciidoc": true, ".tex": true, ".ltx": true,
+	".pdf": true, ".epub": true, ".mobi": true,
+	".doc": true, ".docx": true, ".odt": true, ".rtf": true,
+}
+
+var dataExts = map[string]bool{
+	".csv": true, ".tsv": true, ".jsonl": true, ".ndjson": true,
+	".sqlite": true, ".db": true, ".sql": true, ".duckdb": true,
+	".parquet": true, ".avro": true, ".orc": true, ".feather": true,
+}
+
+var videoExts = map[string]bool{
+	".mp4": true, ".mkv": true, ".webm": true, ".mov": true,
+	".avi": true, ".flv": true, ".wmv": true, ".m4v": true,
+	".mpg": true, ".mpeg": true, ".3gp": true, ".ogv": true,
+}
+
+var audioExts = map[string]bool{
+	".mp3": true, ".flac": true, ".wav": true, ".ogg": true,
+	".m4a": true, ".aac": true, ".opus": true, ".wma": true,
+	".aiff": true, ".aif": true, ".ape": true,
+}
+
+var fontExts = map[string]bool{
+	".ttf": true, ".otf": true, ".woff": true, ".woff2": true,
+	".eot": true, ".fon": true, ".bdf": true, ".pcf": true,
 }
 
 // Common directory names (for simple ls output without -l)
@@ -190,14 +257,37 @@ func colorizeFilename(name string, typeChar byte) string {
 func colorizeFileByExt(name string) string {
 	// Check for compound extensions like .tar.gz
 	lower := strings.ToLower(name)
-	if strings.Contains(lower, ".tar.") || archiveExts[filepath.Ext(lower)] {
+	ext := filepath.Ext(lower)
+
+	if strings.Contains(lower, ".tar.") || archiveExts[ext] {
 		return colorRed + name + colorReset
 	}
-	if imageExts[filepath.Ext(lower)] {
+	if imageExts[ext] {
 		return colorMagenta + name + colorReset
 	}
-	if execExts[filepath.Ext(lower)] {
-		return colorGreen + name + colorReset
+	if videoExts[ext] {
+		return colorPurple + name + colorReset
+	}
+	if audioExts[ext] {
+		return colorOrange + name + colorReset
+	}
+	if fontExts[ext] {
+		return colorCyan + name + colorReset
+	}
+	if codeExts[ext] {
+		return colorBrightBlue + name + colorReset
+	}
+	if configExts[ext] {
+		return colorYellow + name + colorReset
+	}
+	if docExts[ext] {
+		return colorBrightCyan + name + colorReset
+	}
+	if dataExts[ext] {
+		return colorBrightGreen + name + colorReset
+	}
+	if execExts[ext] {
+		return colorBrightGreen + name + colorReset
 	}
 	// Dotfiles
 	if strings.HasPrefix(name, ".") {
