@@ -108,15 +108,6 @@ Press Tab for AI-powered command and path completion, context-aware from your se
 ### 📋 Command history
 Arrow keys navigate history, `Ctrl+R` for reverse search. History persists across sessions in `~/.slop_history`.
 
-### 🐧 Distro themes
-```bash
-slop-shell --distro arch    # btw
-slop-shell --distro ubuntu  # default
-slop-shell --distro debian  # stable life
-slop-shell --distro fedora  # cutting edge
-slop-shell --distro gentoo  # emerge yourself
-```
-
 ### 🖥️ Login MOTD
 Realistic message-of-the-day on startup with uptime, memory, load average, and pending updates.
 
@@ -124,7 +115,6 @@ Realistic message-of-the-day on startup with uptime, memory, load average, and p
 
 | Flag | Description |
 |------|-------------|
-| `--distro` | Linux distro to simulate: `ubuntu`, `arch`, `debian`, `fedora`, `gentoo` (default: `ubuntu`) |
 | `--no-stream` | Disable streaming output |
 | `--no-motd` | Disable login MOTD |
 | `--no-color` | Disable colored output hints |

@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"flag"
+
 	"fmt"
 	"io"
 	"net/http"
@@ -86,26 +86,12 @@ type SlopShell struct {
 	history      []Content
 	systemPrompt Content
 	client       *http.Client
-	distro       string
 	user         string
 	isRoot       bool
 	streaming    bool
 }
 
-func buildSystemPrompt(user, distro string) string {
-	distroInfo := map[string]string{
-		"ubuntu": `The system runs Ubuntu 24.04 LTS "Noble Numbat". Use apt as the package manager. Include typical Ubuntu paths and configs. /etc/os-release shows Ubuntu. The default shell theme should feel Ubuntu-like.`,
-		"arch":   `The system runs Arch Linux (rolling release). Use pacman as the package manager (pacman -S to install, pacman -Syu to update). Include typical Arch paths. /etc/os-release shows Arch. The user probably has a customized setup with AUR packages.`,
-		"debian": `The system runs Debian 12 "Bookworm". Use apt as the package manager. Include typical Debian stable paths and configs. /etc/os-release shows Debian.`,
-		"fedora": `The system runs Fedora 40. Use dnf as the package manager. Include typical Fedora paths. /etc/os-release shows Fedora.`,
-		"gentoo": `The system runs Gentoo Linux. Use emerge as the package manager. The user compiles everything from source. Include typical Gentoo paths with /etc/portage/. The user is hardcore.`,
-	}
-
-	distroLine := distroInfo["ubuntu"] // default
-	if d, ok := distroInfo[distro]; ok {
-		distroLine = d
-	}
-
+func buildSystemPrompt(user string) string {
 	return fmt.Sprintf(`You are a fully hallucinated Unix/Linux shell. You must pretend to be a real bash shell running on a Linux system. You are NOT an AI assistant — you ARE a shell.
 
 CRITICAL RULES:
@@ -125,8 +111,8 @@ CRITICAL RULES:
 14. Be creative with file contents and system state — make it feel like a real lived-in system with realistic config files, logs, etc.
 15. For long outputs (like large file listings), produce a reasonable amount — don't truncate too aggressively, make it feel real.
 
-DISTRO:
-%s
+SYSTEM:
+The system runs Ubuntu 24.04 LTS. Use apt as the package manager.
 The kernel is: Linux slopbox 6.8.0-slop #1 SMP x86_64 GNU/Linux
 
 COLOR OUTPUT:
@@ -157,16 +143,16 @@ For normal user: %s@slopbox:<cwd>$
 For root: root@slopbox:<cwd># 
 Where <cwd> is the current working directory (use ~ for the user's home).
 
-IMPORTANT: Your entire response must be ONLY what would appear in a terminal. Start your output immediately — no preamble, no explanation.`, user, user, distroLine, user)
+IMPORTANT: Your entire response must be ONLY what would appear in a terminal. Start your output immediately — no preamble, no explanation.`, user, user, user)
 }
 
-func newSlopShell(apiKey, model, distro string, streaming bool) *SlopShell {
+func newSlopShell(apiKey, model string, streaming bool) *SlopShell {
 	user := os.Getenv("USER")
 	if user == "" {
 		user = "user"
 	}
 
-	systemText := buildSystemPrompt(user, distro)
+	systemText := buildSystemPrompt(user)
 
 	return &SlopShell{
 		apiKey:  apiKey,
@@ -176,7 +162,6 @@ func newSlopShell(apiKey, model, distro string, streaming bool) *SlopShell {
 			Parts: []Part{{Text: systemText}},
 		},
 		client:    &http.Client{Timeout: 120 * time.Second},
-		distro:    distro,
 		user:      user,
 		isRoot:    false,
 		streaming: streaming,
@@ -417,7 +402,7 @@ Return between 1-8 completions, most likely first. Just the completion words, no
 
 // --- MOTD ---
 
-func generateMOTD(user, distro string) string {
+func generateMOTD(user string) string {
 	now := time.Now()
 	upDays := 12 + now.Day()%20
 	upHours := now.Hour()
@@ -433,33 +418,18 @@ func generateMOTD(user, distro string) string {
 
 	procs := 180 + now.Second()%40
 
-	var distroLine string
-	switch distro {
-	case "arch":
-		distroLine = "  Arch Linux (rolling)\n"
-	case "fedora":
-		distroLine = "  Fedora 40 (Workstation Edition)\n"
-	case "debian":
-		distroLine = "  Debian GNU/Linux 12 (bookworm)\n"
-	case "gentoo":
-		distroLine = "  Gentoo Base System release 2.15\n"
-	default:
-		distroLine = "  Ubuntu 24.04 LTS (Noble Numbat)\n"
-	}
-
 	updates := 3 + now.Day()%15
 	secUpdates := now.Day() % 4
 
 	motd := fmt.Sprintf("\033[2m"+
 		"Welcome to slopbox!\n\n"+
-		"%s"+
+		"  Ubuntu 24.04 LTS (Noble Numbat)\n"+
 		"  Kernel: Linux 6.8.0-slop x86_64\n"+
 		"  Uptime: %d days, %d:%02d\n"+
 		"  Load:   %.2f, %.2f, %.2f\n"+
 		"  Memory: %dMB / %dMB (%dMB free)\n"+
 		"  Procs:  %d\n\n"+
 		"  Last login: %s from 192.168.1.%d\n",
-		distroLine,
 		upDays, upHours, upMins,
 		load1, load5, load15,
 		memUsed, memTotal, memFree,
@@ -633,11 +603,19 @@ func (c *aiCompleter) Do(line []rune, pos int) ([][]rune, int) {
 func main() {
 	loadEnv()
 
-	distro := flag.String("distro", "ubuntu", "Linux distro to simulate (ubuntu, arch, debian, fedora, gentoo)")
-	noStream := flag.Bool("no-stream", false, "Disable streaming output")
-	noMOTD := flag.Bool("no-motd", false, "Disable login MOTD")
-	noColor := flag.Bool("no-color", false, "Disable colored output hints")
-	flag.Parse()
+	noStream := false
+	noMOTD := false
+	noColor := false
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--no-stream":
+			noStream = true
+		case "--no-motd":
+			noMOTD = true
+		case "--no-color":
+			noColor = true
+		}
+	}
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
@@ -656,19 +634,17 @@ func main() {
 
 	printBanner(model)
 
-	streaming := !*noStream
-	shell := newSlopShell(apiKey, model, *distro, streaming)
+	streaming := !noStream
+	shell := newSlopShell(apiKey, model, streaming)
 
-	if *noColor {
-		// Append instruction to suppress colors
+	if noColor {
 		shell.systemPrompt.Parts[0].Text += "\n\nDo NOT use any ANSI color codes in your output. Plain text only."
 	}
 
 	user := shell.user
 
-	// Print MOTD
-	if !*noMOTD {
-		fmt.Print(generateMOTD(user, *distro))
+	if !noMOTD {
+		fmt.Print(generateMOTD(user))
 	}
 
 	initialPrompt := fmt.Sprintf("%s@slopbox:~$ ", user)
