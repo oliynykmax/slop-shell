@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/chzyer/readline"
 )
 
 const (
@@ -301,9 +303,7 @@ func main() {
 		user = "user"
 	}
 
-	// Print initial prompt locally — no API call needed
 	initialPrompt := fmt.Sprintf("%s@slopbox:~$ ", user)
-	fmt.Print(initialPrompt)
 
 	// Seed history so model knows where we started
 	shell.history = append(shell.history,
@@ -311,18 +311,36 @@ func main() {
 		Content{Role: "model", Parts: []Part{{Text: initialPrompt}}},
 	)
 
-	// Handle Ctrl+C gracefully
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT)
-	go func() {
-		for range sigChan {
-			fmt.Printf("\n%s", initialPrompt)
-		}
-	}()
+	// Set up readline with history file
+	historyFile := filepath.Join(os.TempDir(), "slop-shell-history")
+	if home, err := os.UserHomeDir(); err == nil {
+		historyFile = filepath.Join(home, ".slop_history")
+	}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		input := scanner.Text()
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:            initialPrompt,
+		HistoryFile:       historyFile,
+		HistorySearchFold: true,
+		InterruptPrompt:   "^C",
+		EOFPrompt:         "exit",
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
+		os.Exit(1)
+	}
+	defer rl.Close()
+
+	// Regex to extract the trailing prompt from model output
+	promptRe := regexp.MustCompile(`(?m)(\S+@slopbox:[^$]*\$ )$`)
+
+	for {
+		line, err := rl.Readline()
+		if err != nil { // io.EOF or Ctrl+D
+			fmt.Println("logout")
+			break
+		}
+
+		input := line
 
 		if input == "exit" || input == "exit 0" || input == "logout" {
 			fmt.Println("logout")
@@ -330,18 +348,26 @@ func main() {
 		}
 
 		if strings.TrimSpace(input) == "" {
-			fmt.Print(initialPrompt)
 			continue
 		}
 
 		resp, err := shell.chat(input)
 		if err != nil {
-			// Print error in a shell-like way
 			fmt.Fprintf(os.Stderr, "\033[2m[slop-shell internal: %v]\033[0m\n", err)
-			fmt.Printf("%s@slopbox:~$ ", user)
 			continue
 		}
 
-		fmt.Print(resp)
+		// Split response into output + trailing prompt
+		if loc := promptRe.FindStringIndex(resp); loc != nil {
+			output := resp[:loc[0]]
+			newPrompt := resp[loc[0]:loc[1]]
+			if output != "" {
+				fmt.Print(output)
+			}
+			rl.SetPrompt(newPrompt)
+		} else {
+			// Model didn't include a prompt — print everything, keep old prompt
+			fmt.Print(resp)
+		}
 	}
 }
